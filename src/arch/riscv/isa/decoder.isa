@@ -6,6 +6,7 @@
 // Copyright (c) 2021 StreamComputing Corp
 // Copyright (c) 2022 Google LLC
 // Copyright (c) 2024 University of Rostock
+// Copyright (c) 2026 BOSC & ICT, CAS
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -2062,6 +2063,575 @@ decode QUADRANT default Unknown::unknown() {
                     EA = Rs1 + Vs2_ud[vs2ElemIdx];
                 }}, inst_flags=SimdIndexedStoreOp);
             }
+        }
+
+        // Attached Matrix Extension (Ztt) v0.6, CUSTOM-1 (0x2b).
+        0x0a: decode FUNCT3 {
+          0x0: decode FUNCT7 {
+            // R3 format.
+            0x00: ZttArithBinaryOp::ztt_mabsdiff_ew(AbsDiff);
+            0x01: ZttArithScalarOp::ztt_mabsdiff_ew_x(AbsDiff);
+            0x02: ZttArithBinaryOp::ztt_madd_ew(Add);
+            0x03: ZttArithScalarOp::ztt_madd_ew_x(Add);
+            0x04: ZttArithBinaryOp::ztt_mhdiff_ew(HalfDiff);
+            0x05: ZttArithScalarOp::ztt_mhdiff_ew_x(HalfDiff);
+            0x06: ZttArithBinaryOp::ztt_mmax_ew(Max);
+            0x07: ZttArithScalarOp::ztt_mmax_ew_x(Max);
+            0x08: ZttArithBinaryOp::ztt_mmean_ew(Mean);
+            0x09: ZttArithScalarOp::ztt_mmean_ew_x(Mean);
+            0x0a: ZttArithBinaryOp::ztt_mmin_ew(Min);
+            0x0b: ZttArithScalarOp::ztt_mmin_ew_x(Min);
+            0x0c: ZttArithBinaryOp::ztt_mmul_ew(Mul);
+            0x0d: ZttArithScalarOp::ztt_mmul_ew_x(Mul);
+            0x0e: ZttArithBinaryOp::ztt_mmulacc_ew(MulAcc);
+            0x0f: ZttArithScalarOp::ztt_mmulacc_ew_x(MulAcc);
+            0x10: ZttArithBinaryOp::ztt_mmulaccneg_ew(MulAccNeg);
+            0x11: ZttArithScalarOp::ztt_mmulaccneg_ew_x(MulAccNeg);
+            0x12: ZttArithBinaryOp::ztt_mmuladd_ew(MulAdd);
+            0x13: ZttArithScalarOp::ztt_mmuladd_ew_x(MulAdd);
+            0x14: ZttArithBinaryOp::ztt_mmulneg_ew(MulNeg);
+            0x15: ZttArithScalarOp::ztt_mmulneg_ew_x(MulNeg);
+            0x16: ZttArithBinaryOp::ztt_mmulsub_ew(MulSub);
+            0x17: ZttArithScalarOp::ztt_mmulsub_ew_x(MulSub);
+            0x18: ZttArithBinaryOp::ztt_msub_ew(Sub);
+            0x19: ZttArithScalarOp::ztt_msub_ew_x(Sub);
+            0x1a: ZttArithBinaryOp::ztt_mand_ew(And);
+            0x1b: ZttArithScalarOp::ztt_mand_ew_x(And);
+            0x1c: ZttArithBinaryOp::ztt_mandnot_ew(AndNot);
+            0x1d: ZttArithScalarOp::ztt_mandnot_ew_x(AndNot);
+            0x1e: ZttArithBinaryOp::ztt_mor_ew(Or);
+            0x1f: ZttArithScalarOp::ztt_mor_ew_x(Or);
+            0x20: ZttArithBinaryOp::ztt_mornot_ew(OrNot);
+            0x21: ZttArithScalarOp::ztt_mornot_ew_x(OrNot);
+            0x22: ZttArithBinaryOp::ztt_msll_ew(ShiftLeft);
+            0x23: ZttArithControlScalarOp::ztt_msll_ew_x(ShiftLeft, 0);
+            0x24: ZttArithBinaryOp::ztt_msra_ew(ShiftRightArithmetic);
+            0x25: ZttArithControlScalarOp::ztt_msra_ew_x(
+                ShiftRightArithmetic, 0);
+            0x26: ZttArithBinaryOp::ztt_msrl_ew(ShiftRightLogical);
+            0x27: ZttArithControlScalarOp::ztt_msrl_ew_x(
+                ShiftRightLogical, 0);
+            0x28: ZttArithBinaryOp::ztt_mxor_ew(Xor);
+            0x29: ZttArithScalarOp::ztt_mxor_ew_x(Xor);
+            0x2a: ZttArithBinaryOp::ztt_mcmovge_ew(CmovGe);
+            0x2b: ZttArithBinaryOp::ztt_mcmovlt_ew(CmovLt);
+            0x2c: ZttArithBinaryOp::ztt_mcmpge_ew(CmpGe);
+            0x2d: ZttArithScalarOp::ztt_mcmpge_ew_x(CmpGe);
+            0x2e: ZttArithBinaryOp::ztt_mcmplt_ew(CmpLt);
+            0x2f: ZttArithScalarOp::ztt_mcmplt_ew_x(CmpLt);
+            0x30: ZttArithBinaryOp::ztt_mselge_ew(SelectGe);
+            0x31: ZttArithBinaryOp::ztt_msellt_ew(SelectLt);
+            0x32: ZttAxisScalarOp::ztt_mcolbcast_ew_x(1, 1);
+            0x33: ZttArithBinaryOp::ztt_mcolgather_ew(Gather);
+            0x34: ZttAxisScalarOp::ztt_mcolshift_ew_x(1, 0);
+            0x35: ZttAxisScalarOp::ztt_mrowbcast_ew_x(0, 1);
+            0x36: ZttArithBinaryOp::ztt_mrowgather_ew(GatherRow);
+            0x37: ZttAxisScalarOp::ztt_mrowshift_ew_x(0, 0);
+            0x38: decode RD {
+              0x0: ZttInPlaceZipOp::ztt_mrowzip_ew(0, 0);
+            }
+            0x39: ZttArithBinaryOp::ztt_mrowscatadd_ew(ScatterAddCol);
+            0x3a: ZttArithBinaryOp::ztt_mcolscatadd_ew(ScatterAddRow);
+            0x3b: ZttArithBinaryOp::ztt_mrowscatmax_ew(ScatterMaxCol);
+            0x3c: ZttArithBinaryOp::ztt_mcolscatmax_ew(ScatterMaxRow);
+            0x3d: ZttPackV06Op::ztt_mpack_ew_x({{
+                ZttTypeInfo destType, srcType;
+                uint32_t len, srcLen, factor, srcGroup, srcSpan;
+                if (!zttGetDatatype(xc, zttDest, false, zttDestType,
+                                    destType) ||
+                    !zttGetDatatype(xc, zttSrc, false, zttSrcType,
+                                    srcType) ||
+                    !zttTileLen(xc, destType, len) ||
+                    !zttTileLen(xc, srcType, srcLen) ||
+                    !zttPackFactor(xc, destType, factor) || factor <= 1 ||
+                    !zttGroupSize(xc, srcType, srcGroup) ||
+                    srcType.bits < xc->readMiscReg(MISCREG_AMEUDSZ) ||
+                    destType.isFloating != srcType.isFloating) {
+                    zttSetUnsupported(xc);
+                    return NoFault;
+                }
+                if (!zttMSpan(ZTT_MS2, 1, 1, srcGroup, srcSpan))
+                    return std::make_shared<IllegalInstFault>(
+                        "invalid AME pack source span", machInst);
+                ZttMRegArray srcRegs{};
+                zttSnapshotMOperand(
+                    xc, ZTT_MS2, srcSpan, zttSrcReg, srcRegs);
+                const uint64_t physicalBits =
+                    zttPhysicalMRegBits(xc, len);
+                const auto srcSquare = zttExtractMOperandSquare(
+                    srcRegs, physicalBits, srcType, len, 0);
+                const uint32_t slot = zttSlot & (factor - 1);
+                for (uint32_t row = 0; row < len; ++row)
+                    for (uint32_t col = 0; col < len; ++col) {
+                        const auto raw = zttReadTileElement(
+                            srcSquare, srcType, len, row, col);
+                        zttWriteTileSquareElement(zttDestReg, destType, len,
+                            slot, row, col,
+                            zttConvertElement(
+                                raw, srcType, destType, xc, zttFpEnv));
+                    }
+            }});
+            0x3e: ZttPackV06Op::ztt_munpack_ew_x({{
+                ZttTypeInfo destType, srcType;
+                uint32_t len, srcLen, factor, destGroup, destSpan;
+                if (!zttGetDatatype(xc, zttDest, false, zttDestType,
+                                    destType) ||
+                    !zttGetDatatype(xc, zttSrc, false, zttSrcType,
+                                    srcType) ||
+                    !zttTileLen(xc, destType, len) ||
+                    !zttTileLen(xc, srcType, srcLen) ||
+                    !zttPackFactor(xc, srcType, factor) || factor <= 1 ||
+                    !zttGroupSize(xc, destType, destGroup) ||
+                    destType.bits < xc->readMiscReg(MISCREG_AMEUDSZ) ||
+                    destType.isFloating != srcType.isFloating) {
+                    zttSetUnsupported(xc);
+                    return NoFault;
+                }
+                if (!zttMSpan(ZTT_MD, 1, 1, destGroup, destSpan))
+                    return std::make_shared<IllegalInstFault>(
+                        "invalid AME unpack destination span", machInst);
+                const uint32_t slot = zttSlot & (factor - 1);
+                ZttMRegArray result{};
+                for (uint32_t i = 0; i < destSpan; ++i)
+                    result[i].zero();
+                const uint64_t physicalBits =
+                    zttPhysicalMRegBits(xc, len);
+                for (uint32_t row = 0; row < len; ++row)
+                    for (uint32_t col = 0; col < len; ++col) {
+                        const auto raw = zttReadTileSquareElement(
+                            zttSrcReg, srcType, len, slot, row, col);
+                        const uint64_t element = uint64_t(row) * len + col;
+                        zttWriteMOperandElement(
+                            result, physicalBits, destType, element,
+                            zttConvertElement(
+                                raw, srcType, destType, xc, zttFpEnv));
+                    }
+                zttCommitMOperand(
+                    xc, ZTT_MD, destSpan, result, zttDestReg);
+            }});
+            0x3f: ZttArithBinaryOp::ztt_mldexp_ew(Ldexp);
+            0x40: ZttArithControlScalarOp::ztt_mldexp_ew_x(Ldexp, 1);
+            0x41: ZttArithBinaryOp::ztt_mldexpacc_ew(LdexpAcc);
+            0x42: ZttArithControlScalarOp::ztt_mldexpacc_ew_x(LdexpAcc, 1);
+            0x43: ZttArithBinaryOp::ztt_mlog2sub_ew(Log2Sub);
+            0x44: ZttArithScalarOp::ztt_mlog2sub_ew_x(Log2Sub);
+            0x45: ZttArithBinaryOp::ztt_mrdexp_ew(Rdexp);
+            0x46: ZttArithBinaryOp::ztt_mrdexpacc_ew(RdexpAcc);
+            0x47: ZttArithBinaryOp::ztt_msublog2_ew(SubLog2);
+            0x48: ZttArithScalarOp::ztt_msublog2_ew_x(SubLog2);
+            0x4a: decode RD {
+              0x0, 0x1, 0x2, 0x3:
+                ZttArith2DOp::ztt_mmulacc_2d(1, 0, 0, 0);
+            }
+            0x4b: decode RD {
+              0x0, 0x1, 0x2, 0x3:
+                ZttArith2DOp::ztt_mmulaccneg_2d(1, 1, 0, 0);
+            }
+            0x4d: decode RD {
+              0x0, 0x1, 0x2, 0x3:
+                ZttArith2DOp::ztt_mmulatacc_2d(1, 0, 1, 0);
+            }
+            0x4e: decode RD {
+              0x0, 0x1, 0x2, 0x3:
+                ZttArith2DOp::ztt_mmulataccneg_2d(1, 1, 1, 0);
+            }
+            0x4f: decode RD {
+              0x0, 0x1, 0x2, 0x3:
+                ZttArith2DOp::ztt_mmulbtacc_2d(1, 0, 0, 1);
+            }
+            0x50: decode RD {
+              0x0, 0x1, 0x2, 0x3:
+                ZttArith2DOp::ztt_mmulbtaccneg_2d(1, 1, 0, 1);
+            }
+            0x54: ZttStridedLoadOp::ztt_mls_st(0);
+            0x55: ZttStridedLoadOp::ztt_mls_tst(1);
+            0x56: ZttStridedStoreOp::ztt_mss_st(0);
+            0x57: ZttStridedStoreOp::ztt_mss_tst(1);
+            0x58: ZttTypedBroadcastOp::ztt_mbcast_m_x();
+            0x59: ZttFixedMoveToMOp::ztt_mmove8_m_x(8);
+            0x5a: ZttFixedMoveToMOp::ztt_mmove16_m_x(16);
+            0x5b: ZttFixedMoveToMOp::ztt_mmove32_m_x(32);
+            0x5c: ZttFixedMoveToMOp::ztt_mmove64_m_x(64);
+            0x5d: ZttFixedMoveFromMOp::ztt_mmove8_x_m(8);
+            0x5e: ZttFixedMoveFromMOp::ztt_mmove16_x_m(16);
+            0x5f: ZttFixedMoveFromMOp::ztt_mmove32_x_m(32);
+            0x60: ZttFixedMoveFromMOp::ztt_mmove64_x_m(64);
+            0x61: decode RD {
+              0x0: ZttInPlaceZipOp::ztt_mcolunzip_ew(1, 1);
+            }
+            0x62: decode RD {
+              0x0: ZttInPlaceZipOp::ztt_mcolzip_ew(1, 0);
+            }
+            0x63: decode RD {
+              0x0: ZttInPlaceZipOp::ztt_mrowunzip_ew(0, 1);
+            }
+
+            // R2 banks.
+            0x51: decode ZTT_XFUNCT5 {
+              0x00: decode RS1 {
+                0x0, 0x1, 0x2, 0x3:
+                  ZttAgettypOp::ztt_agettyp({{
+                      zttResult = zttSrcType;
+                  }});
+              }
+              0x01: decode RD {
+                0x0, 0x1, 0x2, 0x3:
+                  ZttAsettypOp::ztt_asettyp({{
+                      ZttTypeInfo type;
+                      if (!zttDecodeType(
+                              xc, zttType & 0xffffffffULL, type) ||
+                          !zttTypeCanExecute(type))
+                          return NoFault;
+                      zttDestType = zttType & 0xffffffffULL;
+                      zttDestReg.zero();
+                  }});
+              }
+              0x02: ZttMgettypOp::ztt_mgettyp({{
+                  zttResult = zttSrcType;
+              }});
+              0x03: ZttMsettypOp::ztt_msettyp({{
+                  ZttTypeInfo type;
+                  if (!zttDecodeType(
+                          xc, zttType & 0xffffffffULL, type) ||
+                      !zttTypeCanExecute(type))
+                      return NoFault;
+                  uint32_t groupSize;
+                  if (!zttGroupSize(xc, type, groupSize))
+                      return NoFault;
+                  if (ZTT_MD % groupSize ||
+                      ZTT_MD + groupSize > RiscvISA::NumZttMatRegs)
+                      return std::make_shared<IllegalInstFault>(
+                          "invalid AME M-register group", machInst);
+                  zttDestType = zttType & 0xffffffffULL;
+                  zttDestReg.zero();
+                  RiscvISA::MatRegContainer zero;
+                  zero.zero();
+                  for (uint32_t i = 1; i < groupSize; ++i)
+                      xc->tcBase()->setReg(
+                          RiscvISA::matRegClass[
+                              RiscvISA::ZttMatRegBase + ZTT_MD + i],
+                          &zero);
+              }});
+              0x04: ZttArithUnaryNamedOp::ztt_mabs_ew(Abs);
+              0x05: ZttArithUnaryNamedOp::ztt_mfrintm_ew(FrintM);
+              0x06: ZttArithUnaryNamedOp::ztt_mfrintn_ew(FrintN);
+              0x07: ZttArithUnaryNamedOp::ztt_mfrintp_ew(FrintP);
+              0x08: ZttArithUnaryNamedOp::ztt_mfrintz_ew(FrintZ);
+              0x0d: ZttConvertOp::ztt_mconv_ew({{
+                  ZttTypeInfo destType, srcType;
+                  uint32_t len;
+                  if (!zttGetDatatype(xc, zttDest, false, zttDestType,
+                                      destType) ||
+                      !zttGetDatatype(xc, zttSrc, false, zttSrcType,
+                                      srcType) ||
+                      !zttTileLen(xc, destType, len) ||
+                      !zttTileLen(xc, srcType, len))
+                      return NoFault;
+                  if ((destType.isFloating &&
+                       !zttIsSupportedFloatType(destType)) ||
+                      (srcType.isFloating &&
+                       !zttIsSupportedFloatType(srcType))) {
+                      zttSetUnsupported(xc);
+                      return NoFault;
+                  }
+                  uint32_t destPack, srcPack, destGroup, srcGroup;
+                  if (!zttPackFactor(xc, destType, destPack) ||
+                      !zttPackFactor(xc, srcType, srcPack) ||
+                      !zttGroupSize(xc, destType, destGroup) ||
+                      !zttGroupSize(xc, srcType, srcGroup))
+                      return NoFault;
+                  const uint32_t squareCount = std::max(destPack, srcPack);
+                  uint32_t destSpan, srcSpan;
+                  if (!zttMSpan(ZTT_MD, squareCount, destPack, destGroup,
+                                destSpan) ||
+                      !zttMSpan(ZTT_MS1, squareCount, srcPack, srcGroup,
+                                srcSpan))
+                      return std::make_shared<IllegalInstFault>(
+                          "invalid AME conversion register span", machInst);
+
+                  std::array<RiscvISA::MatRegContainer,
+                             RiscvISA::NumZttMatRegs> sources{};
+                  std::array<RiscvISA::MatRegContainer,
+                             RiscvISA::NumZttMatRegs> results{};
+                  sources[0] = zttSrcReg;
+                  for (uint32_t i = 1; i < srcSpan; ++i)
+                      xc->tcBase()->getReg(
+                          RiscvISA::matRegClass[
+                              RiscvISA::ZttMatRegBase + ZTT_MS1 + i],
+                          &sources[i]);
+                  for (uint32_t i = 0; i < destSpan; ++i)
+                      results[i].zero();
+
+                  const uint64_t physicalBits = uint64_t(len) * len *
+                      xc->readMiscReg(MISCREG_AMEUDSZ);
+                  const uint64_t elementCount =
+                      uint64_t(squareCount) * len * len;
+                  for (uint64_t element = 0; element < elementCount;
+                       ++element) {
+                      const auto raw = zttReadMOperandElement(
+                          sources, physicalBits, srcType, element);
+                      zttWriteMOperandElement(
+                          results, physicalBits, destType, element,
+                          zttConvertElement(
+                              raw, srcType, destType, xc, zttFpEnv));
+                  }
+                  zttDestReg = results[0];
+                  for (uint32_t i = 1; i < destSpan; ++i)
+                      xc->tcBase()->setReg(
+                          RiscvISA::matRegClass[
+                              RiscvISA::ZttMatRegBase + ZTT_MD + i],
+                          &results[i]);
+              }});
+              0x0e: ZttArithUnaryNamedOp::ztt_mcos_ew(Cos);
+              0x0f: ZttArithUnaryNamedOp::ztt_mexp2_ew(Exp2);
+              0x10: ZttArithUnaryNamedOp::ztt_mlog2_ew(Log2);
+              0x11: ZttArithUnaryNamedOp::ztt_mrec_ew(Rec);
+              0x12: ZttArithUnaryNamedOp::ztt_mrsqrt_ew(Rsqrt);
+              0x13: ZttArithUnaryNamedOp::ztt_msin_ew(Sin);
+              0x14: ZttArithUnaryNamedOp::ztt_msqrt_ew(Sqrt);
+              0x15: ZttArithUnaryNamedOp::ztt_mtanh_ew(Tanh);
+              0x16: ZttWholeLoadOp::ztt_mls_1r();
+              0x17: ZttLoadOp::ztt_mls_cm(1);
+              0x18: ZttLoadOp::ztt_mls_rm(0);
+              0x19: ZttWholeStoreOp::ztt_mss_1r();
+              0x1a: ZttStoreOp::ztt_mss_cm(1);
+              0x1b: ZttStoreOp::ztt_mss_rm(0);
+              0x1c: decode RS1 {
+                0x0, 0x1, 0x2, 0x3:
+                  ZttAccToMatOp::ztt_mmov_m_a({{
+                      if (zttDestType != zttSrcType) {
+                          zttSetUnsupported(xc);
+                          return NoFault;
+                      }
+                      ZttTypeInfo type;
+                      uint32_t len, packFactor, groupSize;
+                      if (!zttGetDatatype(xc, zttDest, false,
+                                          zttDestType, type) ||
+                          !zttTileLen(xc, type, len) ||
+                          !zttPackFactor(xc, type, packFactor) ||
+                          !zttGroupSize(xc, type, groupSize))
+                          return NoFault;
+                      if (packFactor > RiscvISA::NumZttAccRegs) {
+                          zttSetUnsupported(xc);
+                          return NoFault;
+                      }
+                      if (ZTT_AMOV_AS + packFactor >
+                              RiscvISA::NumZttAccRegs)
+                          return std::make_shared<IllegalInstFault>(
+                              "invalid AME accumulator span", machInst);
+                      uint32_t destSpan;
+                      if (!zttMSpan(ZTT_MD, packFactor, packFactor,
+                                    groupSize, destSpan))
+                          return std::make_shared<IllegalInstFault>(
+                              "invalid AME M-register group", machInst);
+
+                      std::array<RiscvISA::MatRegContainer,
+                                 RiscvISA::NumZttAccRegs> sources{};
+                      std::array<RiscvISA::MatRegContainer,
+                                 RiscvISA::NumZttMatRegs> results{};
+                      sources[0] = zttSrcReg;
+                      for (uint32_t i = 1; i < packFactor; ++i)
+                          xc->tcBase()->getReg(
+                              RiscvISA::matRegClass[
+                                  RiscvISA::ZttAccRegBase +
+                                  ZTT_AMOV_AS + i],
+                              &sources[i]);
+                      for (uint32_t i = 0; i < destSpan; ++i)
+                          results[i].zero();
+                      const uint64_t physicalBits = uint64_t(len) * len *
+                          xc->readMiscReg(MISCREG_AMEUDSZ);
+                      for (uint32_t square = 0; square < packFactor;
+                           ++square) {
+                          for (uint32_t row = 0; row < len; ++row) {
+                              for (uint32_t col = 0; col < len; ++col) {
+                                  const auto value = zttReadTileElement(
+                                      sources[square], type, len, row, col);
+                                  const uint64_t element =
+                                      (uint64_t(square) * len + row) * len +
+                                      col;
+                                  zttWriteMOperandElement(
+                                      results, physicalBits, type, element,
+                                      value);
+                              }
+                          }
+                      }
+                      zttDestReg = results[0];
+                      for (uint32_t i = 1; i < destSpan; ++i)
+                          xc->tcBase()->setReg(
+                              RiscvISA::matRegClass[
+                                  RiscvISA::ZttMatRegBase + ZTT_MD + i],
+                              &results[i]);
+                  }});
+              }
+              0x1d: decode RD {
+                0x0, 0x1, 0x2, 0x3:
+                  ZttMatToAccOp::ztt_mmov_a_m({{
+                      if (zttDestType != zttSrcType) {
+                          zttSetUnsupported(xc);
+                          return NoFault;
+                      }
+                      ZttTypeInfo type;
+                      uint32_t len, packFactor, groupSize;
+                      if (!zttGetDatatype(xc, zttSrc, false,
+                                          zttSrcType, type) ||
+                          !zttTileLen(xc, type, len) ||
+                          !zttPackFactor(xc, type, packFactor) ||
+                          !zttGroupSize(xc, type, groupSize))
+                          return NoFault;
+                      if (packFactor > RiscvISA::NumZttAccRegs) {
+                          zttSetUnsupported(xc);
+                          return NoFault;
+                      }
+                      if (ZTT_AD + packFactor >
+                              RiscvISA::NumZttAccRegs)
+                          return std::make_shared<IllegalInstFault>(
+                              "invalid AME accumulator span", machInst);
+                      uint32_t srcSpan;
+                      if (!zttMSpan(ZTT_MS, packFactor, packFactor,
+                                    groupSize, srcSpan))
+                          return std::make_shared<IllegalInstFault>(
+                              "invalid AME M-register group", machInst);
+
+                      std::array<RiscvISA::MatRegContainer,
+                                 RiscvISA::NumZttMatRegs> sources{};
+                      std::array<RiscvISA::MatRegContainer,
+                                 RiscvISA::NumZttAccRegs> results{};
+                      sources[0] = zttSrcReg;
+                      for (uint32_t i = 1; i < srcSpan; ++i)
+                          xc->tcBase()->getReg(
+                              RiscvISA::matRegClass[
+                                  RiscvISA::ZttMatRegBase + ZTT_MS + i],
+                              &sources[i]);
+                      for (uint32_t i = 0; i < packFactor; ++i)
+                          results[i].zero();
+                      const uint64_t physicalBits = uint64_t(len) * len *
+                          xc->readMiscReg(MISCREG_AMEUDSZ);
+                      for (uint32_t square = 0; square < packFactor;
+                           ++square) {
+                          for (uint32_t row = 0; row < len; ++row) {
+                              for (uint32_t col = 0; col < len; ++col) {
+                                  const uint64_t element =
+                                      (uint64_t(square) * len + row) * len +
+                                      col;
+                                  const auto value = zttReadMOperandElement(
+                                      sources, physicalBits, type, element);
+                                  zttWriteTileElement(results[square], type,
+                                      len, row, col, value);
+                              }
+                          }
+                      }
+                      zttDestReg = results[0];
+                      for (uint32_t i = 1; i < packFactor; ++i)
+                          xc->tcBase()->setReg(
+                              RiscvISA::matRegClass[
+                                  RiscvISA::ZttAccRegBase + ZTT_AD + i],
+                              &results[i]);
+                  }});
+              }
+              0x1e: ZttTileMoveOp::ztt_mmov_m_m({{
+                  if (zttDestType != zttSrcType) {
+                      zttSetUnsupported(xc);
+                      return NoFault;
+                  }
+                  ZttTypeInfo type;
+                  uint32_t len, packFactor, groupSize;
+                  if (!zttGetDatatype(xc, zttDest, false,
+                                      zttDestType, type) ||
+                      !zttTileLen(xc, type, len) ||
+                      !zttPackFactor(xc, type, packFactor) ||
+                      !zttGroupSize(xc, type, groupSize))
+                      return NoFault;
+                  uint32_t destSpan, srcSpan;
+                  if (!zttMSpan(ZTT_MD, packFactor, packFactor, groupSize,
+                                destSpan) ||
+                      !zttMSpan(ZTT_MS, packFactor, packFactor, groupSize,
+                                srcSpan))
+                      return std::make_shared<IllegalInstFault>(
+                          "invalid AME M-register move span", machInst);
+                  std::array<RiscvISA::MatRegContainer,
+                             RiscvISA::NumZttMatRegs> source{};
+                  source[0] = zttSrcReg;
+                  for (uint32_t i = 1; i < srcSpan; ++i)
+                      xc->tcBase()->getReg(
+                          RiscvISA::matRegClass[
+                              RiscvISA::ZttMatRegBase + ZTT_MS + i],
+                          &source[i]);
+                  zttDestReg = source[0];
+                  for (uint32_t i = 1; i < destSpan; ++i)
+                      xc->tcBase()->setReg(
+                          RiscvISA::matRegClass[
+                              RiscvISA::ZttMatRegBase + ZTT_MD + i],
+                          &source[i]);
+              }});
+              0x1f: ZttArithUnaryNamedOp::ztt_mprefixadd_col(
+                  PrefixAddCol);
+            }
+            0x52: decode ZTT_XFUNCT5 {
+              0x00: ZttArithUnaryNamedOp::ztt_mprefixadd_row(
+                  PrefixAddRow);
+              0x01: ZttArithUnaryNamedOp::ztt_mprefixmax_col(
+                  PrefixMaxCol);
+              0x02: ZttArithUnaryNamedOp::ztt_mprefixmax_row(
+                  PrefixMaxRow);
+              0x03: ZttArithUnaryNamedOp::ztt_mreduceadd_col(
+                  ReduceAddCol);
+              0x04: ZttArithUnaryNamedOp::ztt_mreduceadd_row(
+                  ReduceAddRow);
+              0x05: ZttArithUnaryNamedOp::ztt_mreducemax_col(
+                  ReduceMaxCol);
+              0x06: ZttArithUnaryNamedOp::ztt_mreducemax_row(
+                  ReduceMaxRow);
+              0x07: ZttArithUnaryNamedOp::ztt_mreducemin_col(
+                  ReduceMinCol);
+              0x08: ZttArithUnaryNamedOp::ztt_mreducemin_row(
+                  ReduceMinRow);
+              0x09: ZttAcquireOp::ztt_ame_acquire();
+              0x0a: decode RS1 {
+                0x0: decode RD {
+                  0x0: ZttReleaseOp::ztt_ame_release();
+                }
+              }
+            }
+            // R1 bank.
+            0x53: decode ZTT_XFUNCT10 {
+              0x000: decode RD {
+                0x0, 0x1, 0x2, 0x3:
+                  ZttArithZeroOp::ztt_mzero_2d_acc({{
+                      ZttTypeInfo type;
+                      uint32_t len;
+                      if (!zttGetDatatype(xc, zttAcc, true, zttAccType,
+                                          type) ||
+                          !zttTileLen(xc, type, len))
+                          return NoFault;
+                      zttAccReg.zero();
+                  }});
+              }
+              0x001: ZttMatZeroOp::ztt_mzero_2d_m({{
+                  ZttTypeInfo type;
+                  uint32_t len, packFactor, groupSize, span;
+                  if (!zttGetDatatype(xc, zttDest, false, zttDestType,
+                                      type) ||
+                      !zttTileLen(xc, type, len) ||
+                      !zttPackFactor(xc, type, packFactor) ||
+                      !zttGroupSize(xc, type, groupSize))
+                      return NoFault;
+                  if (!zttMSpan(ZTT_MD, packFactor, packFactor, groupSize,
+                                span))
+                      return std::make_shared<IllegalInstFault>(
+                          "invalid AME M-register zero span", machInst);
+                  zttDestReg.zero();
+                  RiscvISA::MatRegContainer zero;
+                  zero.zero();
+                  for (uint32_t i = 1; i < span; ++i)
+                      xc->tcBase()->setReg(
+                          RiscvISA::matRegClass[
+                              RiscvISA::ZttMatRegBase + ZTT_MD + i],
+                          &zero);
+              }});
+              0x002: ZttIndexOp::ztt_mcolid_ew(1);
+              0x003: ZttIndexOp::ztt_mrowid_ew(0);
+            }
+          }
         }
 
         0x0b: decode FUNCT3 {

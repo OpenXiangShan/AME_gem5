@@ -15,6 +15,7 @@
 # Copyright (c) 2016 The University of Virginia
 # Copyright (c) 2023 The Regents of the University of California
 # Copyright (c) 2024 University of Rostock
+# Copyright (c) 2026 BOSC & ICT, CAS
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -584,6 +585,19 @@ class RiscvISA(BaseISA):
         "If wfi_resume_on_pending is set to False, the hart will only "
         "resume the execution when an locally enabled interrupt becomes "
         "pending.",
+    )
+
+    ame_backend_state = Param.String(
+        "available",
+        "AME acquisition backend state: available, busy, unsupported, "
+        "disabled, interrupted, denied, impl_success, or impl_failure. "
+        "A busy TRY returns BUSY; a busy BOUNDED_WAIT returns TIMEOUT.",
+    )
+
+    ame_max_int_dtype = Param.UInt32(
+        0x40000080,
+        "Integer datatype descriptor used by mldexp.ew.x and "
+        "mldexpacc.ew.x (default: signed Int128, RNU)",
     )
 
     def _effective_riscv_type(self):

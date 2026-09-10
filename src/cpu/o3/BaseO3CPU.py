@@ -1,5 +1,6 @@
 # Copyright (c) 2016, 2019, 2025 Arm Limited
 # Copyright (c) 2022-2023 The University of Edinburgh
+# Copyright (c) 2026 BOSC & ICT, CAS
 # All rights reserved.
 #
 # The license below extends only to copyright in the software and shall
@@ -181,7 +182,7 @@ class BaseO3CPU(BaseCPU):
     numPhysVecPredRegs = Param.Unsigned(
         32, "Number of physical predicate registers"
     )
-    numPhysMatRegs = Param.Unsigned(2, "Number of physical matrix registers")
+    numPhysMatRegs = Param.Unsigned(128, "Number of physical matrix registers")
     # most ISAs don't use condition-code regs, so default is 0
     numPhysCCRegs = Param.Unsigned(0, "Number of physical cc registers")
     instQueues = VectorParam.IQUnit(IQUnit(), "Vector of IQs")

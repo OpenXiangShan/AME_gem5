@@ -5,6 +5,7 @@
  * Copyright (c) 2020 Barkhausen Institut
  * Copyright (c) 2021 StreamComputing Corp
  * Copyright (c) 2025 University of Athens
+ * Copyright (c) 2026 BOSC & ICT, CAS
  * All rights reserved
  *
  * The license below extends only to copyright in the software and shall
@@ -202,6 +203,14 @@ enum MiscRegIndex
     MISCREG_VL,
     MISCREG_VTYPE,
     MISCREG_VLENB,
+
+    MISCREG_AMESTATUS,
+    MISCREG_AMENLEN,
+    MISCREG_AMEUDSZ,
+    MISCREG_AMESTYPE,
+    MISCREG_AMEOWN,
+    MISCREG_AMEFFLAGS,
+    MISCREG_AMEXSAT,
 
     // H-extension registers (RV64)
 
@@ -534,6 +543,14 @@ enum CSRIndex
     CSR_VL           = 0xC20,
     CSR_VTYPE        = 0xC21,
     CSR_VLENB        = 0xC22,
+
+    CSR_AMENLEN   = 0xCC0,
+    CSR_AMEUDSZ   = 0xCC1,
+    CSR_AMESTYPE  = 0xCC2,
+    CSR_AMEOWN    = 0xCC3,
+    CSR_AMEFFLAGS = 0xCC4,
+    CSR_AMEXSAT   = 0xCC5,
+    CSR_AMESTATUS = 0x800,
 
     CSR_MNSCRATCH    = 0x740,
     CSR_MNEPC        = 0x741,
@@ -1224,6 +1241,28 @@ const std::unordered_map<int, CSRMetadata> CSRData = {
     {CSR_VLENB,
         {"VLENB", MISCREG_VLENB, rvTypeFlags(RV64, RV32), isaExtsFlags('v')}},
 
+    {CSR_AMESTATUS,
+     {"amestatus", MISCREG_AMESTATUS, rvTypeFlags(RV64, RV32),
+      isaExtsFlags('m')}},
+    {CSR_AMENLEN,
+     {"amenlen", MISCREG_AMENLEN, rvTypeFlags(RV64, RV32),
+      isaExtsFlags('m')}},
+    {CSR_AMEUDSZ,
+     {"ameudsz", MISCREG_AMEUDSZ, rvTypeFlags(RV64, RV32),
+      isaExtsFlags('m')}},
+    {CSR_AMESTYPE,
+     {"amestype", MISCREG_AMESTYPE, rvTypeFlags(RV64, RV32),
+      isaExtsFlags('m')}},
+    {CSR_AMEOWN,
+     {"ameown", MISCREG_AMEOWN, rvTypeFlags(RV64, RV32),
+      isaExtsFlags('m')}},
+    {CSR_AMEFFLAGS,
+     {"amefflags", MISCREG_AMEFFLAGS, rvTypeFlags(RV64, RV32),
+      isaExtsFlags('m')}},
+    {CSR_AMEXSAT,
+     {"amexsat", MISCREG_AMEXSAT, rvTypeFlags(RV64, RV32),
+      isaExtsFlags('m')}},
+
     {CSR_MNSCRATCH,
         {"mnscratch", MISCREG_MNSCRATCH, rvTypeFlags(RV64, RV32),
          isaExtsFlags(), true}},
@@ -1339,6 +1378,7 @@ BitUnion64(STATUS)
     Bitfield<35, 34> sxl;
     Bitfield<33, 32> uxl;
     Bitfield<31> rv32_sd;
+    Bitfield<24, 23> ms;
     Bitfield<22> tsr;
     Bitfield<21> tw;
     Bitfield<20> tvm;
@@ -1509,6 +1549,7 @@ const RegVal STATUS_MXR_MASK = 1ULL << 19;
 const RegVal STATUS_SUM_MASK = 1ULL << 18;
 const RegVal STATUS_MPRV_MASK = 1ULL << 17;
 const RegVal STATUS_XS_MASK = 3ULL << 15;
+const RegVal STATUS_MS_MASK = 3ULL << 23;
 const RegVal STATUS_FS_MASK = 3ULL << FS_OFFSET;
 const RegVal STATUS_MPP_MASK = 3ULL << 11;
 const RegVal STATUS_VS_MASK = 3ULL << VS_OFFSET;
@@ -1536,15 +1577,18 @@ MSTATUS_MASKS[enums::Num_RiscvType][enums::Num_PrivilegeModeSet] = {
     [RV32] = {
         [enums::M] = STATUS_SD_MASKS[RV32] |
                      STATUS_XS_MASK | STATUS_FS_MASK | STATUS_VS_MASK |
+                     STATUS_MS_MASK |
                      STATUS_MPIE_MASK | STATUS_MIE_MASK,
         [enums::MU] = STATUS_SD_MASKS[RV32] | STATUS_TW_MASK  |
                       STATUS_MPRV_MASK |
                       STATUS_XS_MASK | STATUS_FS_MASK | STATUS_VS_MASK |
+                      STATUS_MS_MASK |
                       STATUS_MPP_MASK | STATUS_MPIE_MASK | STATUS_MIE_MASK,
         [enums::MSU] = STATUS_SD_MASKS[RV32] | STATUS_TSR_MASK |
                        STATUS_TW_MASK | STATUS_TVM_MASK | STATUS_MXR_MASK |
                        STATUS_SUM_MASK | STATUS_MPRV_MASK |
                        STATUS_XS_MASK | STATUS_FS_MASK | STATUS_VS_MASK |
+                       STATUS_MS_MASK |
                        STATUS_MPP_MASK | STATUS_SPP_MASK |
                        STATUS_MPIE_MASK | STATUS_SPIE_MASK |
                        STATUS_MIE_MASK | STATUS_SIE_MASK,
@@ -1552,10 +1596,12 @@ MSTATUS_MASKS[enums::Num_RiscvType][enums::Num_PrivilegeModeSet] = {
     [RV64] = {
         [enums::M] = STATUS_SD_MASKS[RV64] | STATUS_MBE_MASK[RV64] |
                      STATUS_XS_MASK | STATUS_FS_MASK | STATUS_VS_MASK |
+                     STATUS_MS_MASK |
                      STATUS_MPIE_MASK | STATUS_MIE_MASK,
         [enums::MU] = STATUS_SD_MASKS[RV64] | STATUS_MBE_MASK[RV64] |
                       STATUS_UXL_MASK | STATUS_TW_MASK |  STATUS_MPRV_MASK |
                       STATUS_XS_MASK | STATUS_FS_MASK | STATUS_VS_MASK |
+                      STATUS_MS_MASK |
                       STATUS_MPP_MASK | STATUS_MPIE_MASK | STATUS_MIE_MASK,
         [enums::MSU] = STATUS_SD_MASKS[RV64] |
                        STATUS_MBE_MASK[RV64] | STATUS_SBE_MASK[RV64] |
@@ -1563,6 +1609,7 @@ MSTATUS_MASKS[enums::Num_RiscvType][enums::Num_PrivilegeModeSet] = {
                        STATUS_TSR_MASK | STATUS_TW_MASK | STATUS_TVM_MASK |
                        STATUS_MXR_MASK | STATUS_SUM_MASK | STATUS_MPRV_MASK |
                        STATUS_XS_MASK | STATUS_FS_MASK | STATUS_VS_MASK |
+                       STATUS_MS_MASK |
                        STATUS_MPP_MASK | STATUS_SPP_MASK |
                        STATUS_MPIE_MASK | STATUS_SPIE_MASK |
                        STATUS_MIE_MASK | STATUS_SIE_MASK,
@@ -1573,6 +1620,7 @@ MSTATUS_MASKS[enums::Num_RiscvType][enums::Num_PrivilegeModeSet] = {
                        STATUS_TSR_MASK | STATUS_TW_MASK | STATUS_TVM_MASK |
                        STATUS_MXR_MASK | STATUS_SUM_MASK | STATUS_MPRV_MASK |
                        STATUS_XS_MASK | STATUS_FS_MASK | STATUS_VS_MASK |
+                       STATUS_MS_MASK |
                        STATUS_MPP_MASK | STATUS_SPP_MASK |
                        STATUS_MPIE_MASK | STATUS_SPIE_MASK |
                        STATUS_MIE_MASK | STATUS_SIE_MASK,
@@ -1612,6 +1660,7 @@ SSTATUS_MASKS[enums::Num_RiscvType][enums::Num_PrivilegeModeSet] = {
         [enums::MSU] = STATUS_SD_MASKS[RV32] | STATUS_MXR_MASK |
                        STATUS_SUM_MASK |
                        STATUS_XS_MASK | STATUS_FS_MASK | STATUS_VS_MASK |
+                       STATUS_MS_MASK |
                        STATUS_SPP_MASK | STATUS_SPIE_MASK | STATUS_SIE_MASK,
     },
     [RV64] = {
@@ -1620,10 +1669,12 @@ SSTATUS_MASKS[enums::Num_RiscvType][enums::Num_PrivilegeModeSet] = {
         [enums::MSU] = STATUS_SD_MASKS[RV64] | STATUS_UXL_MASK |
                        STATUS_MXR_MASK | STATUS_SUM_MASK |
                        STATUS_XS_MASK | STATUS_FS_MASK | STATUS_VS_MASK |
+                       STATUS_MS_MASK |
                        STATUS_SPP_MASK | STATUS_SPIE_MASK | STATUS_SIE_MASK,
         [enums::MHSU] = STATUS_SD_MASKS[RV64] | STATUS_UXL_MASK |
                         STATUS_MXR_MASK | STATUS_SUM_MASK | STATUS_UBE_MASK |
                         STATUS_XS_MASK | STATUS_FS_MASK | STATUS_VS_MASK |
+                        STATUS_MS_MASK |
                         STATUS_SPP_MASK | STATUS_SPIE_MASK | STATUS_SIE_MASK,
     },
 };

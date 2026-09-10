@@ -1,6 +1,7 @@
 /*
  * Copyright (c) 2012, 2016-2017 ARM Limited
  * Copyright (c) 2013 Advanced Micro Devices, Inc.
+ * Copyright (c) 2026 BOSC & ICT, CAS
  * All rights reserved
  *
  * The license below extends only to copyright in the software and shall
@@ -41,6 +42,7 @@
 
 #include "cpu/thread_context.hh"
 
+#include <algorithm>
 #include <vector>
 
 #include "arch/generic/vec_pred_reg.hh"
@@ -232,8 +234,47 @@ unserialize(ThreadContext &tc, CheckpointIn &cp)
         const size_t array_bytes = reg_bytes * reg_count;
 
         auto regs = std::make_unique<uint8_t[]>(array_bytes);
-        arrayParamIn(cp, std::string("regs.") + reg_class->name(), regs.get(),
-                array_bytes);
+        const std::string param_name =
+            std::string("regs.") + reg_class->name();
+
+        if (reg_class->type() != MatRegClass) {
+            arrayParamIn(cp, param_name, regs.get(), array_bytes);
+        } else {
+            std::fill_n(regs.get(), array_bytes, 0);
+
+            // Checkpoints from before matrix-register support contain an
+            // empty entry (or no entry) and restore as all-zero state.
+            std::vector<uint8_t> checkpoint_regs;
+            if (cp.entryExists(Serializable::currentSection(), param_name))
+                arrayParamIn(cp, param_name, checkpoint_regs);
+
+            if (!checkpoint_regs.empty()) {
+                fatal_if(reg_count == 0 ||
+                         checkpoint_regs.size() % reg_count != 0,
+                         "Matrix register array size mismatch on %s:%s "
+                         "(Got %zu bytes for %zu registers)\n",
+                         Serializable::currentSection(), param_name,
+                         checkpoint_regs.size(), reg_count);
+
+                const size_t checkpoint_reg_bytes =
+                    checkpoint_regs.size() / reg_count;
+                fatal_if(checkpoint_reg_bytes > reg_bytes,
+                         "Matrix register size mismatch on %s:%s "
+                         "(Got %zu bytes per register, expected at most "
+                         "%zu)\n",
+                         Serializable::currentSection(), param_name,
+                         checkpoint_reg_bytes, reg_bytes);
+
+                // Older checkpoints can have narrower matrix registers.
+                // Expand each register separately to preserve boundaries.
+                for (size_t i = 0; i < reg_count; ++i) {
+                    std::copy_n(checkpoint_regs.data() +
+                                    i * checkpoint_reg_bytes,
+                                checkpoint_reg_bytes,
+                                regs.get() + i * reg_bytes);
+                }
+            }
+        }
 
         auto *reg_ptr = regs.get();
         for (const auto &id: *reg_class) {

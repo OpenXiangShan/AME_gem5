@@ -12,6 +12,7 @@
 #
 # Copyright (c) 2003-2005 The Regents of The University of Michigan
 # Copyright (c) 2013,2015 Advanced Micro Devices, Inc.
+# Copyright (c) 2026 BOSC & ICT, CAS
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -502,6 +503,164 @@ class MatRegOperand(RegOperand):
 class MatRegOperandDesc(RegOperandDesc):
     def __init__(self, *args, **kwargs):
         super().__init__("matRegClass", MatRegOperand, *args, **kwargs)
+
+
+class ZttMatRegOperand(MatRegOperand):
+    """A Ztt matrix container with a bounded bank-local selector."""
+
+    def regId(self):
+        selector = self.reg_spec
+        return (
+            f"(({selector}) < RiscvISA::NumZttMatRegs) ? "
+            f"RiscvISA::matRegClass["
+            f"RiscvISA::ZttMatRegBase + ({selector})] : RegId()"
+        )
+
+
+class ZttMatRegOperandDesc(RegOperandDesc):
+    def __init__(self, *args, **kwargs):
+        super().__init__("matRegClass", ZttMatRegOperand, *args, **kwargs)
+
+
+class ZttMatRegIndexOperand(RegOperand):
+    """A Ztt tile selector mapped into the RISC-V matrix register file.
+
+    The encoded selector remains bank-local.  The RISC-V-specific base is
+    applied only when creating the physical MatRegClass RegId or when passing
+    the structural index to a Ztt execution helper.
+    """
+
+    reg_class = "matRegClass"
+
+    def selectorExpr(self):
+        return self.reg_spec
+
+    def indexExpr(self):
+        return f"RiscvISA::ZttMatRegBase + ({self.selectorExpr()})"
+
+    def regId(self):
+        selector = self.selectorExpr()
+        index = self.indexExpr()
+        return (
+            f"(({selector}) < RiscvISA::NumZttMatRegs) ? "
+            f"RiscvISA::matRegClass[{index}] : RegId()"
+        )
+
+    def makeDecl(self):
+        return f"uint32_t {self.base_name} = {self.indexExpr()};\n"
+
+    def makeRead(self):
+        return ""
+
+    def makeWrite(self):
+        return ""
+
+
+class ZttAccRegIndexOperand(ZttMatRegIndexOperand):
+    """A Ztt accumulator selector mapped into its RISC-V matrix-file bank."""
+
+    def indexExpr(self):
+        return f"RiscvISA::ZttAccRegBase + ({self.selectorExpr()})"
+
+    def regId(self):
+        selector = self.selectorExpr()
+        index = self.indexExpr()
+        return (
+            f"(({selector}) < RiscvISA::NumZttAccRegs) ? "
+            f"RiscvISA::matRegClass[{index}] : RegId()"
+        )
+
+
+class ZttMatDataRegOperand(RegOperand):
+    """An md-selected Ztt datatype register stored in MatRegClass.
+
+    Each datatype register has dedicated matrix-container storage.  Its low
+    RegVal holds the descriptor and the rest is zeroed on each write, so the
+    register is physical state without introducing a Ztt reg-class globally.
+    """
+
+    reg_class = "matRegClass"
+
+    def selectorExpr(self):
+        return self.reg_spec
+
+    def indexExpr(self):
+        return f"RiscvISA::ZttMatDataRegBase + ({self.selectorExpr()})"
+
+    def regId(self):
+        selector = self.selectorExpr()
+        index = self.indexExpr()
+        return (
+            f"(({selector}) < RiscvISA::NumZttMatDataRegs) ? "
+            f"RiscvISA::matRegClass[{index}] : RegId()"
+        )
+
+    def makeDecl(self):
+        return f"RegVal {self.base_name} = 0;\n"
+
+    def makeRead(self):
+        tmp_name = f"tmp_s{self.src_reg_idx}"
+        return (
+            f"RiscvISA::MatRegContainer {tmp_name};\n"
+            f"xc->getRegOperand(this, {self.src_reg_idx}, &{tmp_name});\n"
+            f"{self.base_name} = {tmp_name}.template as<RegVal>()[0][0];\n"
+        )
+
+    def makeWrite(self):
+        tmp_name = f"tmp_d{self.dest_reg_idx}"
+        return f"""
+        {{
+        RiscvISA::MatRegContainer {tmp_name};
+        {tmp_name}.zero();
+        {tmp_name}.template as<RegVal>()[0][0] = {self.base_name};
+        xc->setRegOperand(this, {self.dest_reg_idx}, &{tmp_name});
+        if (traceData) {{
+        traceData->setData(matRegClass, &{tmp_name});
+        }}
+        }}"""
+
+
+class ZttAccDataRegOperand(ZttMatDataRegOperand):
+    """The ad-selected Ztt datatype register (ztt_ad0 through ztt_ad3)."""
+
+    def indexExpr(self):
+        return f"RiscvISA::ZttAccDataRegBase + ({self.selectorExpr()})"
+
+    def regId(self):
+        selector = self.selectorExpr()
+        index = self.indexExpr()
+        return (
+            f"(({selector}) < RiscvISA::NumZttAccDataRegs) ? "
+            f"RiscvISA::matRegClass[{index}] : RegId()"
+        )
+
+
+class ZttMatRegIndexOperandDesc(RegOperandDesc):
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            "matRegClass", ZttMatRegIndexOperand, *args, **kwargs
+        )
+
+
+class ZttAccRegIndexOperandDesc(RegOperandDesc):
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            "matRegClass", ZttAccRegIndexOperand, *args, **kwargs
+        )
+
+
+class ZttMatDataRegOperandDesc(RegOperandDesc):
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            "matRegClass", ZttMatDataRegOperand, *args, **kwargs
+        )
+
+
+class ZttAccDataRegOperandDesc(RegOperandDesc):
+    def __init__(self, *args, **kwargs):
+        super().__init__(
+            "matRegClass", ZttAccDataRegOperand, *args, **kwargs
+        )
 
 
 class ControlRegOperand(RegOperand):

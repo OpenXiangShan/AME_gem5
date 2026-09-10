@@ -13,6 +13,7 @@
  * modified or unmodified, in source code or in binary form.
  *
  * Copyright (c) 2017 The University of Virginia
+ * Copyright (c) 2026 BOSC & ICT, CAS
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -187,6 +188,13 @@ EndBitUnion(ExtMachInst)
 
 constexpr unsigned MaxVecLenInBits = 65536;
 constexpr unsigned MaxVecLenInBytes  = MaxVecLenInBits >> 3;
+
+// Ztt needs 2048 bits for a 4x4 Int128 square.  The 128-bit row granularity
+// remains unchanged; narrower datatypes simply leave the upper rows unused.
+constexpr unsigned MaxMatLenInBits = 2048;
+constexpr unsigned MaxMatLenInBytes = MaxMatLenInBits >> 3;
+constexpr unsigned MaxMatRowLenInBits = 128;
+constexpr unsigned MaxMatRowLenInBytes = MaxMatRowLenInBits >> 3;
 
 
 } // namespace RiscvISA

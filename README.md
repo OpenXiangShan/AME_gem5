@@ -1,99 +1,67 @@
-# The gem5 Simulator
+# AME_gem5: AME Instruction Set Extension for gem5
 
-This is the repository for the gem5 simulator. It contains the full source code
-for the simulator and all tests and regressions.
+AME_gem5 is an open-source simulation and validation environment built upon the gem5 system-level simulator, specifically designed to provide comprehensive support for the Attached Matrix Extension (AME) instruction set. It is our expectation that this gem5 simulator will provide support for AME functional verification, performance modeling, and analysis. We actively encourage contributions from the broader community to collaboratively develop and refine this simulator, and thereby advance the optimization and architectural design of the AME extension.
 
-The gem5 simulator is a modular platform for computer-system architecture
-research, encompassing system-level architecture as well as processor
-microarchitecture. It is primarily used to evaluate new hardware designs,
-system software changes, and compile-time and run-time system optimizations.
+![AME_gem5 system overview](docs/ztt-v0.6_system_overview.png)
 
-The main website can be found at <http://www.gem5.org>.
+## Key Features
 
-## Testing status
+- **AME Ztt v0.6 Instruction type supported**
+  - Resource Management
+  - Datatype Management
+  - Elementwise Arithmetic
+  - Bitwise
+  - Compare and Predication
+  - Permutation
+  - Register move / data conversion
+  - Elementwise Math Functions
+  - Memory
+  - State Management
+  - Matrix Multiply
+  - Reduction
 
-**Note**: These regard tests run on the develop branch of gem5:
-<https://github.com/gem5/gem5/tree/develop>.
+See the community release of spec Ztt v0.6 for details.
 
-[![Daily Tests](https://github.com/gem5/gem5/actions/workflows/daily-tests.yaml/badge.svg?branch=develop)](https://github.com/gem5/gem5/actions/workflows/daily-tests.yaml)
-[![Weekly Tests](https://github.com/gem5/gem5/actions/workflows/weekly-tests.yaml/badge.svg?branch=develop)](https://github.com/gem5/gem5/actions/workflows/weekly-tests.yaml)
-[![Compiler Tests](https://github.com/gem5/gem5/actions/workflows/compiler-tests.yaml/badge.svg?branch=develop)](https://github.com/gem5/gem5/actions/workflows/compiler-tests.yaml)
+## Quick Start
 
-## Getting started
+### Prerequisites
 
-A good starting point is <http://www.gem5.org/about>, and for
-more information about building the simulator and getting started
-please see <http://www.gem5.org/documentation> and
-<http://www.gem5.org/documentation/learning_gem5/introduction>.
+- A C++ compiler, Python 3, SCons, and the other gem5 dependencies. See the [gem5 build documentation](https://www.gem5.org/documentation/general_docs/building/).
+- Git with submodule support.
 
-## Building gem5
+### Build gem5
 
-To build gem5, you will need the following software: g++ or clang,
-Python (gem5 links in the Python interpreter), SCons, zlib, m4, and lastly
-protobuf if you want trace capture and playback support. Please see
-<http://www.gem5.org/documentation/general_docs/building> for more details
-concerning the minimum versions of these tools.
+In the AME_gem5 root directory:
 
-Once you have all dependencies resolved, execute
-`scons build/ALL/gem5.opt` to build an optimized version of the gem5 binary
-(`gem5.opt`) containing all gem5 ISAs. If you only wish to compile gem5 to
-include a single ISA, you can replace `ALL` with the name of the ISA. Valid
-options include `ARM`, `NULL`, `MIPS`, `POWER`, `RISCV`, `SPARC`, and `X86`
-The complete list of options can be found in the build_opts directory.
+```sh
+scons build/RISCV/gem5.opt -j$(nproc)
+```
 
-See https://www.gem5.org/documentation/general_docs/building for more
-information on building gem5.
+Then, install the packaged AME LLVM and GNU RISC-V toolchain:
 
-## The Source Tree
+```sh
+./scripts/build_toolchain.sh
+```
+### Run examples and tests
 
-The main source tree includes these subdirectories:
+Build and test an operator example:
 
-* build_opts: pre-made default configurations for gem5
-* build_tools: tools used internally by gem5's build process.
-* configs: example simulation configuration scripts
-* ext: less-common external packages needed to build gem5
-* include: include files for use in other programs
-* site_scons: modular components of the build system
-* src: source code of the gem5 simulator. The C++ source, Python wrappers, and Python standard library are found in this directory.
-* system: source for some optional system software for simulated systems
-* tests: regression tests
-* util: useful utility programs and files
+```sh
+make -C example gemm_fp32
+```
 
-## gem5 Resources
+Build and test all operators:
 
-To run full-system simulations, you may need compiled system firmware, kernel
-binaries and one or more disk images, depending on gem5's configuration and
-what type of workload you're trying to run. Many of these resources can be
-obtained from <https://resources.gem5.org>.
+```sh
+make -C example test
+```
 
-More information on gem5 Resources can be found at
-<https://www.gem5.org/documentation/general_docs/gem5_resources/>.
+On Ubuntu 24.04.3 LTS, instruction, operator, and function-level tests pass.
 
-## Getting Help, Reporting bugs, and Requesting Features
+## License
 
-We provide a variety of channels for users and developers to get help, report
-bugs, requests features, or engage in community discussions. Below
-are a few of the most common we recommend using.
-
-* **GitHub Discussions**: A GitHub Discussions page. This can be used to start
-discussions or ask questions. Available at
-<https://github.com/orgs/gem5/discussions>.
-* **GitHub Issues**: A GitHub Issues page for reporting bugs or requesting
-features. Available at <https://github.com/gem5/gem5/issues>.
-* **Jira Issue Tracker**: A Jira Issue Tracker for reporting bugs or requesting
-features. Available at <https://gem5.atlassian.net/>.
-* **Slack**: A Slack server with a variety of channels for the gem5 community
-to engage in a variety of discussions. Please visit
-<https://www.gem5.org/join-slack> to join.
-* **gem5-users@gem5.org**: A mailing list for users of gem5 to ask questions
-or start discussions. To join the mailing list please visit
-<https://www.gem5.org/mailing_lists>.
-* **gem5-dev@gem5.org**: A mailing list for developers of gem5 to ask questions
-or start discussions. To join the mailing list please visit
-<https://www.gem5.org/mailing_lists>.
-
-## Contributing to gem5
-
-We hope you enjoy using gem5. When appropriate we advise sharing your
-contributions to the project. <https://www.gem5.org/contributing> can help you
-get started. Additional information can be found in the CONTRIBUTING.md file.
+New AME_gem5 code is distributed under the BSD three-clause license in
+[LICENSE](LICENSE). The original gem5 code and its existing per-file
+copyrights remain covered by [COPYING](COPYING) and the notices in each file.
+Third-party components retain their own `LICENSE`, `COPYING`, or `NOTICE`
+terms.

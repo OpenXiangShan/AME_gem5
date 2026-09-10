@@ -4,6 +4,7 @@
 // Copyright (c) 2016 The University of Virginia
 // Copyright (c) 2020 Barkhausen Institut
 // Copyright (c) 2024 University of Rostock
+// Copyright (c) 2026 BOSC & ICT, CAS
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -48,7 +49,8 @@ def operand_types {{
     'vwu'   : 'vwu',
     'vext'  : 'vext',
     'vextu' : 'vextu',
-    'vc'    : 'RiscvISA::VecRegContainer'
+    'vc'    : 'RiscvISA::VecRegContainer',
+    'mc'    : 'RiscvISA::MatRegContainer'
 }};
 
 let {{
@@ -98,6 +100,61 @@ def operands {{
     'Vs1': VecRegOp('vc', 'VS1', 'IsVector', 2),
     'Vs2': VecRegOp('vc', 'VS2', 'IsVector', 3),
     'Vs3': VecRegOp('vc', 'VS3', 'IsVector', 4),
+
+# Ztt v0.6 register groups.  An encoded md=k names both ZttM[k] (contents)
+# and ZttMD[k] (datatype); ad=k similarly names ZttAcc[k] and ZttAD[k].
+# These are paired architectural identities, not aliases.  The format records
+# both dependencies explicitly without inventing another encoded selector.
+    'ZttXd':     IntReg('ud', 'ZTT_XD', 'IsInteger', 1),
+    'ZttXs1':    IntReg('ud', 'ZTT_XS1', 'IsInteger', 2),
+    'ZttXs2':    IntReg('ud', 'ZTT_XS2', 'IsInteger', 3),
+    'ZttMd':     ZttMatRegIndexOp('ud', 'ZTT_MD', 'IsMatrix', 1),
+    'ZttMs1':    ZttMatRegIndexOp('ud', 'ZTT_MS1', 'IsMatrix', 2),
+    'ZttMs2':    ZttMatRegIndexOp('ud', 'ZTT_MS2', 'IsMatrix', 3),
+    'ZttMs':     ZttMatRegIndexOp('ud', 'ZTT_MS', 'IsMatrix', 2),
+    'ZttStoreMs1': ZttMatRegIndexOp(
+        'ud', 'ZTT_STORE_MS1', 'IsMatrix', 2),
+    'ZttAd':     ZttAccRegIndexOp('ud', 'ZTT_AD', 'IsMatrix', 1),
+    'ZttAgetAd': ZttAccRegIndexOp('ud', 'ZTT_AGET_AD', 'IsMatrix', 2),
+    'ZttAmovAs': ZttAccRegIndexOp('ud', 'ZTT_AMOV_AS', 'IsMatrix', 2),
+    'ZttMdReg': ZttMatRegOp('mc', 'ZTT_MD', 'IsMatrix', 1),
+    'ZttMdNextReg': ZttMatRegOp('mc', 'ZTT_MD + 1', 'IsMatrix', 2),
+    'ZttMdNext2Reg': ZttMatRegOp('mc', 'ZTT_MD + 2', 'IsMatrix', 3),
+    'ZttMdNext3Reg': ZttMatRegOp('mc', 'ZTT_MD + 3', 'IsMatrix', 4),
+    'ZttMdNext4Reg': ZttMatRegOp('mc', 'ZTT_MD + 4', 'IsMatrix', 5),
+    'ZttMdNext5Reg': ZttMatRegOp('mc', 'ZTT_MD + 5', 'IsMatrix', 6),
+    'ZttMdNext6Reg': ZttMatRegOp('mc', 'ZTT_MD + 6', 'IsMatrix', 7),
+    'ZttMdNext7Reg': ZttMatRegOp('mc', 'ZTT_MD + 7', 'IsMatrix', 8),
+    'ZttMs1Reg': ZttMatRegOp('mc', 'ZTT_MS1', 'IsMatrix', 2),
+    'ZttMs1NextReg': ZttMatRegOp('mc', 'ZTT_MS1 + 1', 'IsMatrix', 3),
+    'ZttMs1Next2Reg': ZttMatRegOp('mc', 'ZTT_MS1 + 2', 'IsMatrix', 4),
+    'ZttMs1Next3Reg': ZttMatRegOp('mc', 'ZTT_MS1 + 3', 'IsMatrix', 5),
+    'ZttMs1Next4Reg': ZttMatRegOp('mc', 'ZTT_MS1 + 4', 'IsMatrix', 6),
+    'ZttMs1Next5Reg': ZttMatRegOp('mc', 'ZTT_MS1 + 5', 'IsMatrix', 7),
+    'ZttMs1Next6Reg': ZttMatRegOp('mc', 'ZTT_MS1 + 6', 'IsMatrix', 8),
+    'ZttMs1Next7Reg': ZttMatRegOp('mc', 'ZTT_MS1 + 7', 'IsMatrix', 9),
+    'ZttMs2Reg': MatRegOp(
+        'mc', 'RiscvISA::ZttMatRegBase + ZTT_MS2', 'IsMatrix', 3),
+    'ZttMsReg': MatRegOp(
+        'mc', 'RiscvISA::ZttMatRegBase + ZTT_MS', 'IsMatrix', 2),
+    'ZttStoreMs1Reg': MatRegOp(
+        'mc', 'RiscvISA::ZttMatRegBase + ZTT_STORE_MS1', 'IsMatrix', 2),
+    'ZttAdReg': MatRegOp(
+        'mc', 'RiscvISA::ZttAccRegBase + ZTT_AD', 'IsMatrix', 1),
+    'ZttAmovAsReg': MatRegOp(
+        'mc', 'RiscvISA::ZttAccRegBase + ZTT_AMOV_AS', 'IsMatrix', 2),
+# These are the actual datatype-register operands selected by md/ad in
+# the instruction encoding.  The Ztt structural, Ztt matrix-datatype,
+# and Ztt accumulator-datatype banks are all physically independent.
+    'ZttMdData':   ZttMatDataRegOp('ud', 'ZTT_MD', 'IsMatrix', 1),
+    'ZttMs1Data':  ZttMatDataRegOp('ud', 'ZTT_MS1', 'IsMatrix', 2),
+    'ZttMs2Data':  ZttMatDataRegOp('ud', 'ZTT_MS2', 'IsMatrix', 3),
+    'ZttMsData':   ZttMatDataRegOp('ud', 'ZTT_MS', 'IsMatrix', 2),
+    'ZttStoreMs1Data': ZttMatDataRegOp(
+        'ud', 'ZTT_STORE_MS1', 'IsMatrix', 2),
+    'ZttAdData':   ZttAccDataRegOp('ud', 'ZTT_AD', 'IsMatrix', 1),
+    'ZttAgetData': ZttAccDataRegOp('ud', 'ZTT_AGET_AD', 'IsMatrix', 2),
+    'ZttAmovData': ZttAccDataRegOp('ud', 'ZTT_AMOV_AS', 'IsMatrix', 2),
 
 #Memory Operand
     'Mem': MemOp('ud', None, (None, 'IsLoad', 'IsStore'), 5),

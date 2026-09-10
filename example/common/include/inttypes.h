@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2026 Jaeuk Lee
+ * Copyright (c) 2026 BOSC & ICT, CAS
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -26,54 +26,16 @@
  * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
 
-    .section .text.init
-    .globl _start
-_start:
-    li      t0, 4096
-1:
-    addi    t0, t0, -1
-    bnez    t0, 1b
+#ifndef AME_EXAMPLE_INTTYPES_H
+#define AME_EXAMPLE_INTTYPES_H
 
-    csrw    mcycle, zero
-    csrw    minstret, zero
+#include <stdint.h>
 
-    nop
-    nop
-    nop
-    nop
+#define PRId32 "d"
+#define PRIu32 "u"
+#define PRIx32 "x"
+#define PRId64 "ld"
+#define PRIu64 "lu"
+#define PRIx64 "lx"
 
-    csrr    a0, mcycle
-    csrr    a1, minstret
-
-    li      a2, 1000
-    bgeu    a0, a2, fail
-    bgeu    a1, a2, fail
-
-pass:
-    li      a0, 0x20
-    la      a1, pass_args
-    j       semihost_exit
-
-fail:
-    li      a0, 0x20
-    la      a1, fail_args
-
-semihost_exit:
-    .option push
-    .option norvc
-    slli    zero, zero, 0x1f
-    ebreak
-    srai    zero, zero, 7
-    .option pop
-
-2:
-    j       2b
-
-    .section .rodata
-    .align 3
-pass_args:
-    .dword  0x20026
-    .dword  0
-fail_args:
-    .dword  0x20026
-    .dword  1
+#endif

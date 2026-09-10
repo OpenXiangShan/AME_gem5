@@ -57,5 +57,6 @@ DebugFlag('TLB')
 
 GTest('vec_reg.test', 'vec_reg.test.cc')
 GTest('vec_pred_reg.test', 'vec_pred_reg.test.cc')
+GTest('mat_reg.test', 'mat_reg.test.cc')
 
 Source('decoder.cc')

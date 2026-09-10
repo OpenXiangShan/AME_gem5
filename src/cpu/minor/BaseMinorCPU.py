@@ -1,4 +1,5 @@
 # Copyright (c) 2012-2014, 2017-2018, 2025-2026 Arm Limited
+# Copyright (c) 2026 BOSC & ICT, CAS
 # All rights reserved.
 #
 # The license below extends only to copyright in the software and shall
@@ -181,6 +182,19 @@ class MinorDefaultFloatSimdFU(MinorFU):
             "FloatDiv",
             "FloatSqrt",
             "Bf16Cvt",
+        ]
+    )
+
+    timings = [MinorFUTiming(description="Float", srcRegsRelativeLats=[2])]
+    opLat = 6
+
+
+class MinorDefaultVectorFU(MinorFU):
+    """Timing resource for non-memory RISC-V Vector instructions."""
+
+    opClasses = minorMakeOpClassSet(
+        [
+            "SimdPredAlu",
             "SimdAdd",
             "SimdAddAcc",
             "SimdAlu",
@@ -222,12 +236,8 @@ class MinorDefaultFloatSimdFU(MinorFU):
             "SimdSm3",
             "SimdSm4e",
             "SimdCrc",
-            "Matrix",
-            "MatrixMov",
-            "MatrixOP",
             "SimdExt",
             "SimdFloatExt",
-            "SimdFloatCvt",
             "SimdConfig",
             "SimdDotProd",
             "SimdBf16Add",
@@ -240,14 +250,17 @@ class MinorDefaultFloatSimdFU(MinorFU):
         ]
     )
 
-    timings = [MinorFUTiming(description="FloatSimd", srcRegsRelativeLats=[2])]
+    timings = [MinorFUTiming(description="Vector", srcRegsRelativeLats=[2])]
     opLat = 6
 
 
-class MinorDefaultPredFU(MinorFU):
-    opClasses = minorMakeOpClassSet(["SimdPredAlu"])
-    timings = [MinorFUTiming(description="Pred", srcRegsRelativeLats=[2])]
-    opLat = 3
+class MinorDefaultMatrixFU(MinorFU):
+    """Fixed-latency timing resource for Ztt Matrix instructions."""
+
+    opClasses = minorMakeOpClassSet(["Matrix", "MatrixMov", "MatrixOP"])
+    timings = [MinorFUTiming(description="Matrix", srcRegsRelativeLats=[0])]
+    opLat = 16
+    issueLat = 16
 
 
 class MinorDefaultMemFU(MinorFU):
@@ -266,6 +279,11 @@ class MinorDefaultMemFU(MinorFU):
             "SimdIndexedLoad",
             "SimdIndexedStore",
             "SimdUnitStrideFaultOnlyFirstLoad",
+            "SimdUnitStrideSegmentedLoad",
+            "SimdUnitStrideSegmentedStore",
+            "SimdUnitStrideSegmentedFaultOnlyFirstLoad",
+            "SimdStrideSegmentedLoad",
+            "SimdStrideSegmentedStore",
             "SimdWholeRegisterLoad",
             "SimdWholeRegisterStore",
         ]
@@ -290,10 +308,32 @@ class MinorDefaultFUPool(MinorFUPool):
         MinorDefaultIntMulFU(),
         MinorDefaultIntDivFU(),
         MinorDefaultFloatSimdFU(),
-        MinorDefaultPredFU(),
+        MinorDefaultVectorFU(),
+        MinorDefaultMatrixFU(),
         MinorDefaultMemFU(),
         MinorDefaultMiscFU(),
     ]
+
+
+def makeMinorDefaultFUPool(matrix_op_lat=16, vector_op_lat=6):
+    """Build the default pool with configurable Matrix/Vector latencies."""
+
+    return MinorDefaultFUPool(
+        funcUnits=[
+            MinorDefaultIntFU(),
+            MinorDefaultIntFU(),
+            MinorDefaultIntMulFU(),
+            MinorDefaultIntDivFU(),
+            MinorDefaultFloatSimdFU(),
+            MinorDefaultVectorFU(opLat=vector_op_lat),
+            MinorDefaultMatrixFU(
+                opLat=matrix_op_lat,
+                issueLat=matrix_op_lat,
+            ),
+            MinorDefaultMemFU(),
+            MinorDefaultMiscFU(),
+        ]
+    )
 
 
 class ThreadPolicy(Enum):

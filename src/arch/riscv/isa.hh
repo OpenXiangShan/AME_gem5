@@ -6,6 +6,7 @@
  * Copyright (c) 2016 The University of Virginia
  * Copyright (c) 2020 Barkhausen Institut
  * Coypright (c) 2024 University of Rostock
+ * Copyright (c) 2026 BOSC & ICT, CAS
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -35,6 +36,7 @@
 #ifndef __ARCH_RISCV_ISA_HH__
 #define __ARCH_RISCV_ISA_HH__
 
+#include <cstdint>
 #include <initializer_list>
 #include <string>
 #include <string_view>
@@ -76,6 +78,49 @@ enum FPUStatus
 };
 
 using VPUStatus = FPUStatus;
+using AMEStatus = FPUStatus;
+
+// v0.6 ame.acquire result status.  The architectural result packs SUCCESS
+// in bit 0 and STATUS in bits 7:1; all upper bits are reserved and read zero.
+enum class AMEAcquireStatus : uint8_t
+{
+    GRANTED = 0x00,
+    BUSY = 0x01,
+    UNSUPPORTED = 0x02,
+    DISABLED = 0x03,
+    BAD_DESC = 0x04,
+    TIMEOUT = 0x05,
+    INTERRUPTED = 0x06,
+    DENIED = 0x07,
+    IMPL_DEFINED = 0x7f,
+};
+
+constexpr RegVal
+encodeAMEAcquireStatus(AMEAcquireStatus status, bool success)
+{
+    const uint32_t statusValue = static_cast<uint32_t>(status) & 0x7f;
+    return RegVal(success) | (RegVal(statusValue) << 1);
+}
+
+constexpr RegVal
+encodeAMEAcquireStatus(AMEAcquireStatus status)
+{
+    return encodeAMEAcquireStatus(
+        status, status == AMEAcquireStatus::GRANTED);
+}
+
+static_assert(encodeAMEAcquireStatus(AMEAcquireStatus::GRANTED) == 0x01);
+static_assert(encodeAMEAcquireStatus(AMEAcquireStatus::BUSY) == 0x02);
+static_assert(encodeAMEAcquireStatus(AMEAcquireStatus::UNSUPPORTED) == 0x04);
+static_assert(encodeAMEAcquireStatus(AMEAcquireStatus::DISABLED) == 0x06);
+static_assert(encodeAMEAcquireStatus(AMEAcquireStatus::BAD_DESC) == 0x08);
+static_assert(encodeAMEAcquireStatus(AMEAcquireStatus::TIMEOUT) == 0x0a);
+static_assert(encodeAMEAcquireStatus(AMEAcquireStatus::INTERRUPTED) == 0x0c);
+static_assert(encodeAMEAcquireStatus(AMEAcquireStatus::DENIED) == 0x0e);
+static_assert(encodeAMEAcquireStatus(AMEAcquireStatus::IMPL_DEFINED) ==
+              0xfe);
+static_assert(encodeAMEAcquireStatus(
+                  AMEAcquireStatus::IMPL_DEFINED, true) == 0xff);
 
 class ISA : public BaseISA
 {
@@ -115,6 +160,12 @@ class ISA : public BaseISA
      * interrupt becomes pending.
     */
     const bool _wfiResumeOnPending;
+
+    /** Static backend state used by the base per-hart AME model. */
+    const std::string _ameBackendState;
+
+    /** Fixed scalar exponent datatype required by Ztt-v0.6. */
+    const uint32_t _ameMaxIntDtype;
 
   public:
     using Params = RiscvISAParams;
@@ -200,6 +251,8 @@ class ISA : public BaseISA
 
     bool resumeOnPending() { return _wfiResumeOnPending; }
 
+    uint32_t ameMaxIntDtype() const { return _ameMaxIntDtype; }
+
     virtual Addr getFaultHandlerAddr(
         RegIndex idx, uint64_t cause, bool intr) const;
 
@@ -212,6 +265,19 @@ class ISA : public BaseISA
 
     Fault hpmCounterCheck(int counter, ExtMachInst machInst) const;
     Fault tvmChecks(uint64_t csr, PrivilegeMode pm, ExtMachInst machInst);
+    Fault checkAMECSRAccess(
+        ExecContext *xc, uint64_t csr, bool write, ExtMachInst machInst);
+    Fault checkAMEStatusWrite(
+        ExecContext *xc, uint64_t csr, RegVal value, ExtMachInst machInst);
+
+    /**
+     * Query the packed backend-specific result for ame.acquire.  The base
+     * model uses the configured per-hart backend state; shared backends can
+     * override this hook to apply live wait and policy decisions without
+     * changing the instruction encoding or writeback.
+     */
+    virtual RegVal ameAcquireResult(
+        uint32_t wait_mode, uint32_t timeout_class) const;
 
     RegVal backdoorReadCSRAllBits(ExecContext *xc, uint64_t csr);
     RegVal readCSR(ExecContext *xc, uint64_t csr);
@@ -234,6 +300,10 @@ Fault updateFPUStatus(
 
 Fault updateVPUStatus(
     ExecContext *xc, ExtMachInst machInst, bool set_dirty, bool check_vill);
+
+Fault checkAMEEnabled(
+    ExecContext *xc, ExtMachInst machInst, bool require_owner = true);
+void markAMEDirty(ExecContext *xc);
 
 } // namespace RiscvISA
 } // namespace gem5

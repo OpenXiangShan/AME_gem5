@@ -4,6 +4,7 @@
 // Copyright (c) 2016 The University of Virginia
 // Copyright (c) 2020 Barkhausen Institut
 // Copyright (c) 2022 Google LLC
+// Copyright (c) 2026 BOSC & ICT, CAS
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -168,3 +169,20 @@ def bitfield SIMM3      simm3;
 
 // Zvbb
 def bitfield BIT26      <26>;
+
+// Ztt v0.6 R3/R2/R1 register and selector fields.
+def bitfield ZTT_XD              <11:7>;
+def bitfield ZTT_XS1             <19:15>;
+def bitfield ZTT_XS2             <24:20>;
+def bitfield ZTT_MD              <11:7>;
+def bitfield ZTT_MS1             <19:15>;
+def bitfield ZTT_MS2             <24:20>;
+def bitfield ZTT_MS              <19:15>;
+def bitfield ZTT_STORE_MS1       <11:7>;
+def bitfield ZTT_AD              <11:7>;
+def bitfield ZTT_ACC             <11:7>;
+def bitfield ZTT_AS              <19:15>;
+def bitfield ZTT_AGET_AD         <19:15>;
+def bitfield ZTT_AMOV_AS         <19:15>;
+def bitfield ZTT_XFUNCT5         <24:20>;
+def bitfield ZTT_XFUNCT10        <24:15>;

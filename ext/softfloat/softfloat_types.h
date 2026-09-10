@@ -52,6 +52,7 @@ typedef struct { uint16_t v; } float16_t;
 typedef struct { uint32_t v; } float32_t;
 typedef struct { uint64_t v; } float64_t;
 typedef struct { uint64_t v[2]; } float128_t;
+typedef float16_t bfloat16_t;
 
 /*----------------------------------------------------------------------------
 | The format of an 80-bit extended floating-point number in memory.  This
@@ -79,4 +80,3 @@ struct extFloat80M { uint16_t signExp; uint64_t signif; };
 typedef struct extFloat80M extFloat80_t;
 
 #endif
-

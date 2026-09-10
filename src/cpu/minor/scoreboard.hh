@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013-2014, 2016-2017 ARM Limited
+ * Copyright (c) 2026 BOSC & ICT, CAS
  * All rights reserved
  *
  * The license below extends only to copyright in the software and shall
