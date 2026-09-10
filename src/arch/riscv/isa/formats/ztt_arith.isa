@@ -1,0 +1,2776 @@
+// -*- mode:c++ -*-
+
+// Copyright (c) 2026 BOSC & ICT, CAS
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met: redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer;
+// redistributions in binary form must reproduce the above copyright
+// notice, this list of conditions and the following disclaimer in the
+// documentation and/or other materials provided with the distribution;
+// neither the name of the copyright holders nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+// Ztt v0.6 polymorphic arithmetic instructions.
+
+
+// In theory, all registers should be sign extended if not operating in the
+// full MXLEN register, but that can make a memory address exceed its range
+// because it is always regarded as uint64. Zero extend PC-related registers
+// and memory addresses, and sign extend other registers.
+
+// ================== Ztt arithmetic instruction support =====================
+let {{
+    def zttArithFlags(flags):
+        # The physical M-register span is datatype-dependent and therefore
+        # cannot be represented by the static operand list.
+        return flags + ('IsSerializeBefore', 'IsSerializeAfter')
+
+    def zttElementwiseOperands(read_dest=False):
+        # Element-wise operations consume the datatype register selected by
+        # every md/ms encoding.  md's datatype is a source because an
+        # element-wise operation preserves the destination descriptor.
+        operands = ('ZttMdReg = zttDestReg; ZttMdData; '
+                    'ZttMs1Reg; ZttMs1Data; ZttMs2Reg; ZttMs2Data;')
+        if read_dest:
+            operands += ' ZttMdReg;'
+        return operands
+
+    def zttElementwiseAliases():
+        return '''
+            auto &zttDestReg = ZttMdReg;
+            const auto &zttLhsReg = ZttMs1Reg;
+            const auto &zttRhsReg = ZttMs2Reg;
+            const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+            const uint32_t zttLhs = RiscvISA::ZttMatRegBase + ZTT_MS1;
+            const uint32_t zttRhs = RiscvISA::ZttMatRegBase + ZTT_MS2;
+            const RegVal zttDestType = ZttMdData;
+            const RegVal zttLhsType = ZttMs1Data;
+            const RegVal zttRhsType = ZttMs2Data;
+        '''
+
+    def zttMatrixMulBehaviour(accumulate, negate, transpose_lhs,
+                              transpose_rhs):
+        return '''
+            constexpr bool zttAccumulate = %s;
+            constexpr bool zttNegateProduct = %s;
+            constexpr bool zttTransposeLhs = %s;
+            constexpr bool zttTransposeRhs = %s;
+            ZttTypeInfo lhsType, rhsType, accType;
+            uint32_t len;
+            if (!zttGetDatatype(xc, zttLhs, false, zttLhsType, lhsType) ||
+                !zttGetDatatype(xc, zttRhs, false, zttRhsType, rhsType) ||
+                !zttGetDatatype(xc, zttAcc, true, zttAccType, accType) ||
+                !zttTileLen(xc, lhsType, len) ||
+                !zttTileLen(xc, rhsType, len) ||
+                !zttTileLen(xc, accType, len)) {
+                return NoFault;
+            }
+
+            const RegVal lhsRaw = zttLhsType;
+            const RegVal rhsRaw = zttRhsType;
+            uint32_t lhsPackFactor, rhsPackFactor;
+            uint32_t lhsGroupSize, rhsGroupSize;
+            if (!zttPackFactor(xc, lhsType, lhsPackFactor) ||
+                !zttPackFactor(xc, rhsType, rhsPackFactor) ||
+                !zttGroupSize(xc, lhsType, lhsGroupSize) ||
+                !zttGroupSize(xc, rhsType, rhsGroupSize)) {
+                return NoFault;
+            }
+            const bool zttTypesCompatible =
+                lhsRaw == rhsRaw &&
+                lhsType.isFloating == rhsType.isFloating &&
+                lhsType.isFloating == accType.isFloating &&
+                lhsType.bits <= 128 && rhsType.bits <= 128 &&
+                accType.bits <= 128 &&
+                (lhsType.isFloating ||
+                 (lhsType.isSigned == rhsType.isSigned &&
+                  lhsType.isSigned == accType.isSigned &&
+                  accType.bits >= lhsType.bits &&
+                  !(accType.bits == 128 && accType.saturating)));
+            if (!zttTypesCompatible ||
+                (lhsType.isFloating && !zttIsSupportedFloatType(lhsType)) ||
+                (rhsType.isFloating && !zttIsSupportedFloatType(rhsType)) ||
+                (accType.isFloating && !zttIsSupportedFloatType(accType))) {
+                zttSetUnsupported(xc);
+                return NoFault;
+            }
+
+            const uint32_t squareCount =
+                std::max(lhsPackFactor, rhsPackFactor);
+            const uint32_t lhsBase =
+                zttLhs - RiscvISA::ZttMatRegBase;
+            const uint32_t rhsBase =
+                zttRhs - RiscvISA::ZttMatRegBase;
+            uint32_t lhsSpan, rhsSpan;
+            if (!zttMSpan(lhsBase, squareCount, lhsPackFactor,
+                          lhsGroupSize, lhsSpan) ||
+                !zttMSpan(rhsBase, squareCount, rhsPackFactor,
+                          rhsGroupSize, rhsSpan)) {
+                return std::make_shared<IllegalInstFault>(
+                    "invalid AME matrix-multiply register span", machInst);
+            }
+            ZttMRegArray lhsSource{}, rhsSource{};
+            zttSnapshotMOperand(
+                xc, lhsBase, lhsSpan, zttLhsReg, lhsSource);
+            zttSnapshotMOperand(
+                xc, rhsBase, rhsSpan, zttRhsReg, rhsSource);
+            const uint64_t physicalBits = zttPhysicalMRegBits(xc, len);
+            auto &accReg = zttAccReg;
+            for (uint32_t i = 0; i < len; ++i) {
+                for (uint32_t j = 0; j < len; ++j) {
+                    unsigned __int128 sum = zttAccumulate ?
+                        zttReadTileElement(accReg, accType, len, i, j) : 0;
+                    for (uint32_t square = 0; square < squareCount;
+                         ++square) {
+                      for (uint32_t k = 0; k < len; ++k) {
+                        const uint32_t lhsRow = zttTransposeLhs ? k : i;
+                        const uint32_t lhsCol = zttTransposeLhs ? i : k;
+                        const uint32_t rhsRow = zttTransposeRhs ? j : k;
+                        const uint32_t rhsCol = zttTransposeRhs ? k : j;
+                        const unsigned __int128 lhs =
+                            zttReadMOperandElement(
+                                lhsSource, physicalBits, lhsType,
+                                (uint64_t(square) * len + lhsRow) * len +
+                                    lhsCol);
+                        const unsigned __int128 rhs =
+                            zttReadMOperandElement(
+                                rhsSource, physicalBits, rhsType,
+                                (uint64_t(square) * len + rhsRow) * len +
+                                    rhsCol);
+                        if (accType.isFloating &&
+                            zttIsSoftFloatType(accType) &&
+                            zttSoftFloatCompatible(lhsType, accType) &&
+                            zttSoftFloatCompatible(rhsType, accType)) {
+                            const auto lhsValue = zttSoftFloatConvert(
+                                lhs, lhsType, accType, zttFpEnv);
+                            const auto rhsValue = zttSoftFloatConvert(
+                                rhs, rhsType, accType, zttFpEnv);
+                            const auto productLhs = zttNegateProduct ?
+                                zttSoftFloatNegate(lhsValue, accType) :
+                                lhsValue;
+                            sum = zttSoftFloatMulAdd(
+                                productLhs, rhsValue, sum, accType, zttFpEnv);
+                        } else if (accType.isFloating) {
+                            const long double product =
+                                zttFloatValue(lhs, lhsType) *
+                                zttFloatValue(rhs, rhsType);
+                            const long double value =
+                                zttFloatValue(sum, accType) +
+                                (zttNegateProduct ? -product : product);
+                            if (std::isnan(value) &&
+                                !std::isnan(zttFloatValue(sum, accType)) &&
+                                !std::isnan(zttFloatValue(lhs, lhsType)) &&
+                                !std::isnan(zttFloatValue(rhs, rhsType)))
+                                zttAccrueFpFlags(zttFpEnv, ZttFpFlagNV);
+                            sum = zttRoundFloat(value, accType, &zttFpEnv);
+                        } else if (accType.isSigned && accType.bits == 128) {
+                            const unsigned __int128 current = sum;
+                            const unsigned __int128 lhsWide =
+                                static_cast<unsigned __int128>(
+                                    zttSignedValue(lhs, lhsType.bits));
+                            const unsigned __int128 rhsWide =
+                                static_cast<unsigned __int128>(
+                                    zttSignedValue(rhs, rhsType.bits));
+                            const unsigned __int128 product =
+                                lhsWide * rhsWide;
+                            sum = zttNegateProduct ? current - product :
+                                                    current + product;
+                        } else if (accType.isSigned) {
+                            const __int128 product =
+                                zttSignedValue(lhs, lhsType.bits) *
+                                zttSignedValue(rhs, rhsType.bits);
+                            const __int128 result =
+                                zttSignedValue(sum, accType.bits) +
+                                (zttNegateProduct ? -product : product);
+                            const __int128 minimum =
+                                -(static_cast<__int128>(1) <<
+                                  (accType.bits - 1));
+                            const __int128 maximum =
+                                (static_cast<__int128>(1) <<
+                                 (accType.bits - 1)) - 1;
+                            if (accType.saturating && result < minimum) {
+                                zttAccrueSaturation(zttFpEnv);
+                                sum = static_cast<unsigned __int128>(minimum) &
+                                      zttBitMask128(accType.bits);
+                            } else if (accType.saturating &&
+                                       result > maximum) {
+                                zttAccrueSaturation(zttFpEnv);
+                                sum = static_cast<unsigned __int128>(maximum);
+                            } else {
+                                sum = static_cast<unsigned __int128>(result) &
+                                      zttBitMask128(accType.bits);
+                            }
+                        } else {
+                            const unsigned __int128 current =
+                                sum & zttBitMask128(accType.bits);
+                            const unsigned __int128 product =
+                                (lhs & zttBitMask128(lhsType.bits)) *
+                                (rhs & zttBitMask128(rhsType.bits));
+                            const unsigned __int128 maximum =
+                                zttBitMask128(accType.bits);
+                            if (zttNegateProduct) {
+                                if (accType.saturating && product > current) {
+                                    zttAccrueSaturation(zttFpEnv);
+                                    sum = 0;
+                                } else {
+                                    sum = (current - product) & maximum;
+                                }
+                            } else {
+                                const unsigned __int128 result =
+                                    current + product;
+                                if (accType.saturating && result > maximum) {
+                                    zttAccrueSaturation(zttFpEnv);
+                                    sum = maximum;
+                                } else {
+                                    sum = result & maximum;
+                                }
+                            }
+                        }
+                      }
+                    }
+                    if (zttIsSoftFloatType(accType))
+                        sum = zttSoftFloatCanonicalizeNaN(sum, accType);
+                    zttWriteTileElement(accReg, accType, len, i, j, sum);
+                }
+            }
+        ''' % tuple('true' if value else 'false' for value in
+                    (accumulate, negate, transpose_lhs, transpose_rhs))
+
+}};
+
+
+output header {{
+#include <algorithm>
+#include <climits>
+
+class ZttArithStaticInst : public ZttStaticInst
+{
+  protected:
+    ZttArithStaticInst(const char *mnem, ExtMachInst machInst,
+                       OpClass opClass)
+        : ZttStaticInst(mnem, machInst, opClass)
+    {}
+};
+}};
+
+output header {{
+namespace
+{
+
+enum class ZttElemwiseOp : uint8_t {
+    Abs, AbsDiff, Add, And, AndNot, Broadcast, CmovGe, CmovLt,
+    CmpGe, CmpLt, ColUnzip, ColZip, Exp2, Gather, GatherRow, HalfDiff, Ldexp,
+    LdexpAcc, Log2, Log2Sub, Max, Mean, Min, Mul, MulAcc, MulAccNeg,
+    MulAdd, MulNeg, MulSub, Or, OrNot, PrefixAddCol, PrefixAddRow,
+    PrefixMaxCol, PrefixMaxRow, Rdexp, RdexpAcc, ReduceAddCol,
+    ReduceAddRow, ReduceMaxCol, ReduceMaxRow, ReduceMinCol, ReduceMinRow,
+    RowUnzip, RowZip, Cos, Rec, Rsqrt, Sin, Sqrt, Tanh,
+    FrintM, FrintN, FrintP, FrintZ,
+    ScatterAddCol, ScatterAddRow, ScatterMaxCol, ScatterMaxRow,
+    SelectGe, SelectLt, Shift, ShiftLeft, ShiftRightArithmetic,
+    ShiftRightLogical, Sub, SubLog2, Xor
+};
+
+inline bool
+zttElemwiseIsPermutation(ZttElemwiseOp op)
+{
+    return op == ZttElemwiseOp::ColUnzip || op == ZttElemwiseOp::ColZip ||
+           (op == ZttElemwiseOp::Gather ||
+            op == ZttElemwiseOp::GatherRow) ||
+           op == ZttElemwiseOp::RowUnzip ||
+           op == ZttElemwiseOp::RowZip;
+}
+
+inline bool
+zttElemwiseIsReduce(ZttElemwiseOp op)
+{
+    return op == ZttElemwiseOp::ReduceAddCol ||
+           op == ZttElemwiseOp::ReduceAddRow ||
+           op == ZttElemwiseOp::ReduceMaxCol ||
+           op == ZttElemwiseOp::ReduceMaxRow ||
+           op == ZttElemwiseOp::ReduceMinCol ||
+           op == ZttElemwiseOp::ReduceMinRow;
+}
+
+inline bool
+zttElemwiseIsPrefix(ZttElemwiseOp op)
+{
+    return op == ZttElemwiseOp::PrefixAddCol ||
+           op == ZttElemwiseOp::PrefixAddRow ||
+           op == ZttElemwiseOp::PrefixMaxCol ||
+           op == ZttElemwiseOp::PrefixMaxRow;
+}
+
+inline bool
+zttElemwiseIsBitwise(ZttElemwiseOp op)
+{
+    return op == ZttElemwiseOp::And || op == ZttElemwiseOp::AndNot ||
+           op == ZttElemwiseOp::Or || op == ZttElemwiseOp::OrNot ||
+           op == ZttElemwiseOp::Xor;
+}
+
+inline bool
+zttElemwiseIsShift(ZttElemwiseOp op)
+{
+    return op == ZttElemwiseOp::Shift ||
+           op == ZttElemwiseOp::ShiftLeft ||
+           op == ZttElemwiseOp::ShiftRightArithmetic ||
+           op == ZttElemwiseOp::ShiftRightLogical;
+}
+
+inline bool
+zttValidateElementwiseTuple(
+    ExecContext *xc, ZttElemwiseOp op, const ZttTypeInfo &destType,
+    const ZttTypeInfo &lhsType, const ZttTypeInfo &rhsType, RegVal destRaw,
+    RegVal lhsRaw, RegVal rhsRaw, bool scalar)
+{
+    bool supported = true;
+    const bool allInteger = !destType.isFloating && !lhsType.isFloating &&
+                            !rhsType.isFloating;
+    const bool allFloating = destType.isFloating && lhsType.isFloating &&
+                             rhsType.isFloating;
+
+    // All standard formats accepted by this implementation have a defined
+    // canonical-NaN representation.  Reject a future format here before any
+    // operand snapshots if that capability is absent.
+    if (destType.isFloating && !zttIsSupportedFloatType(destType)) {
+        zttSetUnsupported(xc);
+        return false;
+    }
+
+    if (zttElemwiseIsBitwise(op)) {
+        supported = allInteger && destRaw == rhsRaw &&
+                    (scalar || destRaw == lhsRaw);
+    } else if (zttElemwiseIsShift(op)) {
+        supported = allInteger &&
+                    (op != ZttElemwiseOp::ShiftRightArithmetic ||
+                     lhsType.isSigned);
+    } else if (op == ZttElemwiseOp::CmpGe ||
+               op == ZttElemwiseOp::CmpLt) {
+        supported = !destType.isFloating &&
+                    (lhsType.isFloating == rhsType.isFloating);
+    } else if (op == ZttElemwiseOp::CmovGe ||
+               op == ZttElemwiseOp::CmovLt ||
+               op == ZttElemwiseOp::SelectGe ||
+               op == ZttElemwiseOp::SelectLt) {
+        supported = destRaw == rhsRaw;
+    } else if (op == ZttElemwiseOp::Max || op == ZttElemwiseOp::Min) {
+        supported = destRaw == rhsRaw && (scalar || destRaw == lhsRaw) &&
+                    (!scalar || lhsType.isFloating == rhsType.isFloating);
+    } else if (op == ZttElemwiseOp::Exp2 ||
+               op == ZttElemwiseOp::Log2 || op == ZttElemwiseOp::Cos ||
+               op == ZttElemwiseOp::Rec || op == ZttElemwiseOp::Rsqrt ||
+               op == ZttElemwiseOp::Sin || op == ZttElemwiseOp::Sqrt ||
+               op == ZttElemwiseOp::Tanh || op == ZttElemwiseOp::FrintM ||
+               op == ZttElemwiseOp::FrintN ||
+               op == ZttElemwiseOp::FrintP ||
+               op == ZttElemwiseOp::FrintZ) {
+        supported = destType.isFloating && lhsType.isFloating;
+    } else if (op == ZttElemwiseOp::Ldexp ||
+               op == ZttElemwiseOp::LdexpAcc ||
+               op == ZttElemwiseOp::Rdexp ||
+               op == ZttElemwiseOp::RdexpAcc) {
+        supported = scalar ?
+            (destType.isFloating == rhsType.isFloating &&
+             !lhsType.isFloating) :
+            (destType.isFloating == lhsType.isFloating &&
+             !rhsType.isFloating);
+    } else if (op == ZttElemwiseOp::Log2Sub ||
+               op == ZttElemwiseOp::SubLog2) {
+        // The logarithm operand and destination are floating.  A bias may be
+        // either a supported floating or integer datatype.
+        supported = scalar ? (destType.isFloating && rhsType.isFloating) :
+                             (destType.isFloating && lhsType.isFloating);
+    } else if (op == ZttElemwiseOp::Gather ||
+               op == ZttElemwiseOp::GatherRow) {
+        supported = destRaw == lhsRaw && !rhsType.isFloating;
+    } else if (op == ZttElemwiseOp::ScatterAddCol ||
+               op == ZttElemwiseOp::ScatterAddRow ||
+               op == ZttElemwiseOp::ScatterMaxCol ||
+               op == ZttElemwiseOp::ScatterMaxRow) {
+        supported = !rhsType.isFloating;
+    } else if (zttElemwiseIsReduce(op) || zttElemwiseIsPrefix(op)) {
+        supported = destType.isFloating == lhsType.isFloating;
+    } else if (zttElemwiseIsPermutation(op)) {
+        supported = destRaw == lhsRaw;
+    } else if (!zttElemwiseIsPermutation(op) &&
+               !zttElemwiseIsReduce(op) && !zttElemwiseIsPrefix(op)) {
+        supported = allInteger || allFloating;
+    }
+
+    if (supported &&
+        ((destType.isFloating && !zttIsSupportedFloatType(destType)) ||
+         (lhsType.isFloating && !zttIsSupportedFloatType(lhsType)) ||
+         (rhsType.isFloating && !zttIsSupportedFloatType(rhsType))))
+        supported = false;
+    if (!supported)
+        zttSetUnsupported(xc);
+    return supported;
+}
+
+using ZttWideInt = boost::multiprecision::cpp_int;
+
+inline ZttWideInt
+zttWideUnsigned(unsigned __int128 raw)
+{
+    ZttWideInt value = static_cast<uint64_t>(raw >> 64);
+    value <<= 64;
+    value += static_cast<uint64_t>(raw);
+    return value;
+}
+
+inline ZttWideInt
+zttWideInteger(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    raw &= zttBitMask128(type.bits);
+    ZttWideInt value = zttWideUnsigned(raw);
+    if (type.isSigned && ((raw >> (type.bits - 1)) & 1))
+        value -= ZttWideInt(1) << type.bits;
+    return value;
+}
+
+inline unsigned __int128
+zttScalarRaw(ExecContext *xc, RegVal scalar, const ZttTypeInfo &type)
+{
+    const auto *isa = static_cast<RiscvISA::ISA *>(
+        xc->tcBase()->getIsaPtr());
+    const uint32_t xlen = isa->rvType() == RiscvISA::RV32 ? 32 : 64;
+    const uint32_t sourceBits = std::min(type.bits, xlen);
+    unsigned __int128 raw = static_cast<unsigned __int128>(scalar) &
+        zttBitMask128(sourceBits);
+    if (!type.isFloating && type.isSigned && type.bits > sourceBits &&
+        ((raw >> (sourceBits - 1)) & 1)) {
+        raw |= zttBitMask128(type.bits) & ~zttBitMask128(sourceBits);
+    }
+    return raw;
+}
+
+inline unsigned __int128
+zttWideToRaw(ZttWideInt value, const ZttTypeInfo &type, ZttFpEnv &fpEnv)
+{
+    const ZttWideInt modulus = ZttWideInt(1) << type.bits;
+    const ZttWideInt minimum = type.isSigned ?
+        -(ZttWideInt(1) << (type.bits - 1)) : ZttWideInt(0);
+    const ZttWideInt maximum = type.isSigned ?
+        (ZttWideInt(1) << (type.bits - 1)) - 1 : modulus - 1;
+    if (type.saturating && value < minimum) {
+        zttAccrueSaturation(fpEnv);
+        value = minimum;
+    } else if (type.saturating && value > maximum) {
+        zttAccrueSaturation(fpEnv);
+        value = maximum;
+    } else if (!type.saturating) {
+        value %= modulus;
+        if (value < 0)
+            value += modulus;
+    }
+    if (value < 0)
+        value += modulus;
+    const ZttWideInt lowMask = (ZttWideInt(1) << 64) - 1;
+    const uint64_t low = (value & lowMask).convert_to<uint64_t>();
+    const uint64_t high = ((value >> 64) & lowMask).convert_to<uint64_t>();
+    return (static_cast<unsigned __int128>(high) << 64) | low;
+}
+
+inline ZttWideInt
+zttRoundWideHalf(const ZttWideInt &value, ZttIntegerRoundingMode mode)
+{
+    ZttWideInt result = value / 2;
+    const bool discarded = (value % 2) != 0;
+    if (value < 0 && discarded)
+        --result;
+    if (!discarded || mode == ZttIntegerRoundingMode::Rdn)
+        return result;
+    const bool retainedOdd = (result % 2) != 0;
+    if (mode == ZttIntegerRoundingMode::Rnu ||
+        (mode == ZttIntegerRoundingMode::Rne && retainedOdd) ||
+        (mode == ZttIntegerRoundingMode::Rod && !retainedOdd))
+        ++result;
+    return result;
+}
+
+inline ZttWideInt
+zttRoundWideShiftRight(const ZttWideInt &value, uint64_t shift,
+                       ZttIntegerRoundingMode mode)
+{
+    if (!value || !shift)
+        return value;
+    // A shift larger than this cannot affect a supported 128-bit result.  It
+    // is still rounded according to the discarded non-zero remainder.
+    if (shift > 4096) {
+        if (mode == ZttIntegerRoundingMode::Rdn)
+            return value < 0 ? ZttWideInt(-1) : ZttWideInt(0);
+        if (mode == ZttIntegerRoundingMode::Rod)
+            return value < 0 ? ZttWideInt(-1) : ZttWideInt(1);
+        return ZttWideInt(0);
+    }
+    const ZttWideInt divisor = ZttWideInt(1) << shift;
+    ZttWideInt quotient = value / divisor;
+    ZttWideInt remainder = value % divisor;
+    if (!remainder)
+        return quotient;
+    if (value < 0) {
+        --quotient;
+        remainder += divisor;
+    }
+    const ZttWideInt half = divisor >> 1;
+    const bool roundUp = mode == ZttIntegerRoundingMode::Rnu ?
+        remainder >= half :
+        mode == ZttIntegerRoundingMode::Rne ?
+            (remainder > half || (remainder == half &&
+                                   (quotient % 2 != 0))) :
+        mode == ZttIntegerRoundingMode::Rod ?
+            (quotient % 2 == 0) : false;
+    return roundUp ? quotient + 1 : quotient;
+}
+
+inline ZttWideInt
+zttScaleInteger(const ZttWideInt &value, const ZttWideInt &exponent,
+                ZttIntegerRoundingMode mode)
+{
+    if (!value || !exponent)
+        return value;
+    const ZttWideInt limit = 4096;
+    if (exponent > 0) {
+        const uint64_t amount = exponent > limit ? 4096 :
+            exponent.convert_to<uint64_t>();
+        return value << amount;
+    }
+    const ZttWideInt magnitude = -exponent;
+    const uint64_t amount = magnitude > limit ? 4097 :
+        magnitude.convert_to<uint64_t>();
+    return zttRoundWideShiftRight(value, amount, mode);
+}
+
+inline long double
+zttScaleFloat(long double value, const ZttWideInt &exponent)
+{
+    if (value == 0.0L || exponent == 0)
+        return value;
+    const ZttWideInt maxInt = std::numeric_limits<int>::max();
+    const ZttWideInt minInt = std::numeric_limits<int>::min();
+    if (exponent > maxInt)
+        return std::copysign(std::numeric_limits<long double>::infinity(),
+                             value);
+    if (exponent < minInt)
+        return std::copysign(0.0L, value);
+    return std::ldexp(value, exponent.convert_to<int>());
+}
+
+inline int
+zttNarrowScaleExponent(const ZttWideInt &exponent)
+{
+    const ZttWideInt limit = 4096;
+    if (exponent > limit)
+        return 4096;
+    if (exponent < -limit)
+        return -4096;
+    return exponent.convert_to<int>();
+}
+
+inline bool
+zttExecuteIntegerElement(
+    ExecContext *xc, ZttFpEnv &fpEnv, unsigned __int128 a,
+    unsigned __int128 b,
+    unsigned __int128 old, const ZttTypeInfo &destType,
+    const ZttTypeInfo &lhsType, const ZttTypeInfo &rhsType,
+    ZttElemwiseOp op, unsigned __int128 &result,
+    const ZttWideInt *scalarExponent = nullptr)
+{
+    const ZttWideInt av = zttWideInteger(a, lhsType);
+    const ZttWideInt bv = zttWideInteger(b, rhsType);
+    const ZttWideInt oldv = zttWideInteger(old, destType);
+    ZttWideInt value;
+    switch (op) {
+    case ZttElemwiseOp::Abs: value = av < 0 ? -av : av; break;
+    case ZttElemwiseOp::AbsDiff:
+        value = av - bv;
+        if (value < 0)
+            value = -value;
+        break;
+    case ZttElemwiseOp::Broadcast: value = av; break;
+    case ZttElemwiseOp::Add: value = av + bv; break;
+    case ZttElemwiseOp::Sub: value = bv - av; break;
+    case ZttElemwiseOp::HalfDiff:
+        value = zttRoundWideHalf(bv - av, destType.integerRounding);
+        break;
+    case ZttElemwiseOp::Mean:
+        value = zttRoundWideHalf(av + bv, destType.integerRounding);
+        break;
+    case ZttElemwiseOp::Max: result = av < bv ? b : a; return true;
+    case ZttElemwiseOp::Min: result = av < bv ? a : b; return true;
+    case ZttElemwiseOp::Mul: value = av * bv; break;
+    case ZttElemwiseOp::MulAcc: value = oldv + av * bv; break;
+    case ZttElemwiseOp::MulAccNeg: value = oldv - av * bv; break;
+    case ZttElemwiseOp::MulAdd: value = av + bv * oldv; break;
+    case ZttElemwiseOp::MulNeg: value = -(av * bv); break;
+    case ZttElemwiseOp::MulSub: value = av - bv * oldv; break;
+    case ZttElemwiseOp::Ldexp: value = zttScaleInteger(
+        av, scalarExponent ? *scalarExponent : bv,
+        destType.integerRounding); break;
+    case ZttElemwiseOp::LdexpAcc: value = oldv + zttScaleInteger(
+        av, scalarExponent ? *scalarExponent : bv,
+        destType.integerRounding); break;
+    case ZttElemwiseOp::Rdexp: value = zttScaleInteger(
+        av, -(scalarExponent ? *scalarExponent : bv),
+        destType.integerRounding); break;
+    case ZttElemwiseOp::RdexpAcc: value = oldv + zttScaleInteger(
+        av, -(scalarExponent ? *scalarExponent : bv),
+        destType.integerRounding); break;
+    case ZttElemwiseOp::CmovGe: result = av < 0 ? old : b; return true;
+    case ZttElemwiseOp::CmovLt: result = av < 0 ? b : old; return true;
+    case ZttElemwiseOp::SelectGe: result = av < 0 ? 0 : b; return true;
+    case ZttElemwiseOp::SelectLt: result = av < 0 ? b : 0; return true;
+    case ZttElemwiseOp::CmpGe:
+        result = av >= bv ? zttBitMask128(destType.bits) : 0;
+        return true;
+    case ZttElemwiseOp::CmpLt:
+        result = av < bv ? zttBitMask128(destType.bits) : 0;
+        return true;
+    case ZttElemwiseOp::And: case ZttElemwiseOp::AndNot:
+    case ZttElemwiseOp::Or: case ZttElemwiseOp::OrNot:
+    case ZttElemwiseOp::Xor: {
+        const unsigned __int128 mask = zttBitMask128(destType.bits);
+        a &= mask;
+        b &= mask;
+        if (op == ZttElemwiseOp::And)
+            result = a & b;
+        else if (op == ZttElemwiseOp::AndNot)
+            result = a & ~b & mask;
+        else if (op == ZttElemwiseOp::Or)
+            result = a | b;
+        else if (op == ZttElemwiseOp::OrNot)
+            result = a | (~b & mask);
+        else
+            result = a ^ b;
+        return true;
+    }
+    case ZttElemwiseOp::Shift:
+    case ZttElemwiseOp::ShiftLeft:
+    case ZttElemwiseOp::ShiftRightArithmetic:
+    case ZttElemwiseOp::ShiftRightLogical: {
+        const uint32_t shift = static_cast<uint32_t>(b) % lhsType.bits;
+        if (op == ZttElemwiseOp::ShiftLeft) {
+            // Preserve the exact intermediate until the single conversion to
+            // the destination datatype below.  Masking here would truncate a
+            // widening result and prevent a saturating destination from
+            // observing overflow.
+            value = av * (ZttWideInt(1) << shift);
+        } else if (op == ZttElemwiseOp::ShiftRightLogical) {
+            value = zttWideUnsigned(
+                (a & zttBitMask128(lhsType.bits)) >> shift);
+        } else {
+            value = av >> shift;
+        }
+        break;
+    }
+    default:
+        return false;
+    }
+    result = zttWideToRaw(value, destType, fpEnv);
+    return true;
+}
+
+inline unsigned __int128
+zttConvertElement(unsigned __int128 raw, const ZttTypeInfo &sourceType,
+                  const ZttTypeInfo &destType, ExecContext *xc,
+                  ZttFpEnv &fpEnv)
+{
+    if (!sourceType.isFloating && !destType.isFloating)
+        return zttWideToRaw(
+            zttWideInteger(raw, sourceType), destType, fpEnv);
+    if (sourceType.isFloating && destType.isFloating) {
+        if (!zttIsSupportedFloatType(sourceType) ||
+            !zttIsSupportedFloatType(destType)) {
+            zttSetUnsupported(xc);
+            return 0;
+        }
+        if (zttIsSoftFloatType(sourceType) && zttIsSoftFloatType(destType))
+            return zttSoftFloatConvert(raw, sourceType, destType, fpEnv);
+        if (zttFloatIsSignalingNaN(raw, sourceType))
+            zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+        return zttRoundFloat(
+            zttFloatValue(raw, sourceType), destType, &fpEnv);
+    }
+    if ((sourceType.isFloating && !zttIsSupportedFloatType(sourceType)) ||
+        (destType.isFloating && !zttIsSupportedFloatType(destType))) {
+        zttSetUnsupported(xc);
+        return 0;
+    }
+    if (!sourceType.isFloating && destType.isFloating) {
+        if (zttIsNarrowFloatType(destType)) {
+            const unsigned __int128 sourceMask =
+                zttBitMask128(sourceType.bits);
+            const unsigned __int128 bits = raw & sourceMask;
+            const bool negative = sourceType.isSigned &&
+                ((bits >> (sourceType.bits - 1)) & 1);
+            const unsigned __int128 magnitude = negative ?
+                ((~bits + 1) & sourceMask) : bits;
+            return RiscvISA::ZttFloatBackend::fromInteger(
+                magnitude, negative, zttNarrowFloatFormat(destType),
+                zttBackendRounding(destType.rounding));
+        }
+        fpEnv.setRounding(destType.rounding);
+        if (sourceType.bits <= 64 && zttIsSoftFloatType(destType)) {
+            const uint64_t value = static_cast<uint64_t>(raw);
+            if (destType.bits == 16)
+                return (sourceType.isSigned ?
+                    i64_to_f16(static_cast<int64_t>(zttSignedValue(
+                        raw, sourceType.bits))) : ui64_to_f16(value)).v;
+            if (destType.bits == 32)
+                return (sourceType.isSigned ?
+                    i64_to_f32(static_cast<int64_t>(zttSignedValue(
+                        raw, sourceType.bits))) : ui64_to_f32(value)).v;
+            return (sourceType.isSigned ?
+                i64_to_f64(static_cast<int64_t>(zttSignedValue(
+                    raw, sourceType.bits))) : ui64_to_f64(value)).v;
+        }
+        return zttRoundFloat(
+            zttWideInteger(raw, sourceType).convert_to<long double>(),
+            destType, &fpEnv);
+    }
+    if (sourceType.isFloating && !destType.isFloating) {
+        const uint64_t fractionBits = sourceType.bits -
+            sourceType.expWidth - 1;
+        const uint64_t exponentMask = zttBitMask(sourceType.expWidth);
+        const uint64_t bits = static_cast<uint64_t>(raw);
+        const uint64_t fraction = bits & zttBitMask(fractionBits);
+        const uint64_t exponent = (bits >> fractionBits) & exponentMask;
+        const bool negative = (bits >> (sourceType.bits - 1)) & 1;
+        if (zttFloatIsNaN(raw, sourceType) ||
+            (sourceType.hasInfinity && exponent == exponentMask &&
+             fraction == 0)) {
+            zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+            return zttWideToRaw(ZttWideInt(0), destType, fpEnv);
+        }
+
+        // Decode the finite source directly into an integer significand and a
+        // binary exponent.  This avoids converting values near 2^128 through
+        // a host floating-point-to-__int128 cast.
+        const int sourceBias = (1 << (sourceType.expWidth - 1)) - 1;
+        ZttWideInt significand = fraction;
+        int binaryExponent;
+        if (exponent == 0) {
+            binaryExponent = 1 - sourceBias - fractionBits;
+        } else {
+            significand += ZttWideInt(1) << fractionBits;
+            binaryExponent = static_cast<int>(exponent) - sourceBias -
+                             fractionBits;
+        }
+        ZttWideInt magnitude;
+        if (!significand) {
+            magnitude = 0;
+        } else if (binaryExponent >= 0) {
+            magnitude = significand << binaryExponent;
+        } else {
+            const uint64_t shift = static_cast<uint64_t>(-binaryExponent);
+            if (shift > 4096) {
+                magnitude = 0;
+            } else {
+                const ZttWideInt divisor = ZttWideInt(1) << shift;
+                magnitude = significand / divisor;
+                const ZttWideInt remainder = significand % divisor;
+                const ZttWideInt half = divisor >> 1;
+                const bool roundUp = remainder &&
+                    (destType.integerRounding == ZttIntegerRoundingMode::Rnu ?
+                        (negative ? remainder > half : remainder >= half) :
+                     destType.integerRounding == ZttIntegerRoundingMode::Rne ?
+                        (remainder > half ||
+                         (remainder == half && (magnitude & 1))) :
+                     destType.integerRounding == ZttIntegerRoundingMode::Rdn ?
+                        negative :
+                     destType.integerRounding == ZttIntegerRoundingMode::Rod ?
+                        !(magnitude & 1) : false);
+                if (roundUp)
+                    ++magnitude;
+                if (remainder)
+                    zttAccrueFpFlags(fpEnv, ZttFpFlagNX);
+            }
+        }
+        ZttWideInt integerValue = negative ? -magnitude : magnitude;
+        const ZttWideInt minimum = destType.isSigned ?
+            -(ZttWideInt(1) << (destType.bits - 1)) : ZttWideInt(0);
+        const ZttWideInt maximum = destType.isSigned ?
+            (ZttWideInt(1) << (destType.bits - 1)) - 1 :
+            (ZttWideInt(1) << destType.bits) - 1;
+        if (integerValue < minimum || integerValue > maximum)
+            zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+        return zttWideToRaw(integerValue, destType, fpEnv);
+    }
+    zttSetUnsupported(xc);
+    return 0;
+}
+
+inline unsigned __int128
+zttSameTypeMaxMin(unsigned __int128 lhs, unsigned __int128 rhs,
+                  const ZttTypeInfo &type, bool maximum, ZttFpEnv &fpEnv)
+{
+    if (!type.isFloating) {
+        const ZttWideInt left = zttWideInteger(lhs, type);
+        const ZttWideInt right = zttWideInteger(rhs, type);
+        return maximum ? (left < right ? rhs : lhs) :
+                         (left < right ? lhs : rhs);
+    }
+    if (zttIsSoftFloatType(type)) {
+        const bool lhsNaN = zttSoftFloatIsNaN(lhs, type);
+        const bool rhsNaN = zttSoftFloatIsNaN(rhs, type);
+        if (lhsNaN || rhsNaN) {
+            if (zttSoftFloatIsSignalingNaN(lhs, type) ||
+                zttSoftFloatIsSignalingNaN(rhs, type))
+                zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+            return zttSoftFloatCanonicalNaN(type);
+        }
+        const unsigned __int128 sign =
+            static_cast<unsigned __int128>(1) << (type.bits - 1);
+        if (((lhs | rhs) & ~sign) == 0)
+            return maximum ? 0 : sign;
+        const bool lhsLess = zttSoftFloatLess(lhs, rhs, type);
+        return maximum ? (lhsLess ? rhs : lhs) : (lhsLess ? lhs : rhs);
+    }
+    const long double left = zttFloatValue(lhs, type);
+    const long double right = zttFloatValue(rhs, type);
+    if (zttFloatIsSignalingNaN(lhs, type) ||
+        zttFloatIsSignalingNaN(rhs, type))
+        zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+    if (std::isnan(left) || std::isnan(right))
+        return zttRoundFloat(
+            std::numeric_limits<long double>::quiet_NaN(), type, &fpEnv);
+    if (left == 0.0L && right == 0.0L) {
+        const unsigned __int128 sign =
+            static_cast<unsigned __int128>(1) << (type.bits - 1);
+        return maximum ? 0 : sign;
+    }
+    return maximum ? (left < right ? rhs : lhs) :
+                     (left < right ? lhs : rhs);
+}
+
+inline unsigned __int128
+zttSameTypeAdd(unsigned __int128 lhs, unsigned __int128 rhs,
+               const ZttTypeInfo &type, ZttFpEnv &fpEnv)
+{
+    if (!type.isFloating)
+        return zttWideToRaw(
+            zttWideInteger(lhs, type) + zttWideInteger(rhs, type), type,
+            fpEnv);
+    if (zttIsSoftFloatType(type))
+        return zttSoftFloatBinary(
+            lhs, rhs, type, ZttSoftBinaryOp::Add, fpEnv);
+    const long double left = zttFloatValue(lhs, type);
+    const long double right = zttFloatValue(rhs, type);
+    if (zttFloatIsSignalingNaN(lhs, type) ||
+        zttFloatIsSignalingNaN(rhs, type))
+        zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+    if (std::isinf(left) && std::isinf(right) &&
+        std::signbit(left) != std::signbit(right))
+        zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+    return zttRoundFloat(
+        zttFloatValue(lhs, type) + zttFloatValue(rhs, type), type, &fpEnv);
+}
+
+inline long double
+zttElemNumeric(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    if (type.isFloating)
+        return zttFloatValue(raw, type);
+    if (type.isSigned)
+        return static_cast<long double>(zttSignedValue(raw, type.bits));
+    return static_cast<long double>(raw & zttBitMask128(type.bits));
+}
+
+inline bool
+zttElemNegative(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    return type.isSigned &&
+           ((raw & zttBitMask128(type.bits)) >> (type.bits - 1));
+}
+
+inline unsigned __int128
+zttElemInteger(long double value, const ZttTypeInfo &type, ZttFpEnv &fpEnv)
+{
+    if (std::isnan(value)) {
+        zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+        value = 0;
+    } else if (std::isinf(value)) {
+        zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+    }
+    if (value > static_cast<long double>(std::numeric_limits<__int128>::max()))
+        value = static_cast<long double>(std::numeric_limits<__int128>::max());
+    if (value < static_cast<long double>(std::numeric_limits<__int128>::min()))
+        value = static_cast<long double>(std::numeric_limits<__int128>::min());
+    const __int128 signedValue = static_cast<__int128>(value);
+    const unsigned __int128 mask = zttBitMask128(type.bits);
+    if (!type.isSigned) {
+        if (signedValue < 0) {
+            if (type.saturating)
+                zttAccrueSaturation(fpEnv);
+            return type.saturating ? 0 :
+                static_cast<unsigned __int128>(signedValue) & mask;
+        }
+        const unsigned __int128 unsignedValue =
+            static_cast<unsigned __int128>(signedValue);
+        if (type.saturating && unsignedValue > mask) {
+            zttAccrueSaturation(fpEnv);
+            return mask;
+        }
+        return unsignedValue & mask;
+    }
+    const __int128 minimum = type.bits == 128 ?
+        std::numeric_limits<__int128>::min() :
+        - (static_cast<__int128>(1) << (type.bits - 1));
+    const __int128 maximum = type.bits == 128 ?
+        std::numeric_limits<__int128>::max() :
+        (static_cast<__int128>(1) << (type.bits - 1)) - 1;
+    const __int128 clamped = type.saturating ?
+        std::max(minimum, std::min(maximum, signedValue)) : signedValue;
+    if (type.saturating && clamped != signedValue)
+        zttAccrueSaturation(fpEnv);
+    return static_cast<unsigned __int128>(clamped) & mask;
+}
+
+inline unsigned __int128
+zttElemEncode(long double value, const ZttTypeInfo &type, ZttFpEnv &fpEnv)
+{
+    return type.isFloating ? zttRoundFloat(value, type, &fpEnv) :
+                             zttElemInteger(value, type, fpEnv);
+}
+
+inline long double
+zttRoundIntegerFraction(long double value, ZttIntegerRoundingMode mode)
+{
+    const long double lower = std::floor(value);
+    const long double fraction = value - lower;
+    switch (mode) {
+    case ZttIntegerRoundingMode::Rnu:
+        return lower + (fraction >= 0.5L ? 1.0L : 0.0L);
+    case ZttIntegerRoundingMode::Rne: {
+        const bool lowerIsOdd = std::fmod(std::fabs(lower), 2.0L) == 1.0L;
+        return lower + (fraction > 0.5L ||
+                        (fraction == 0.5L && lowerIsOdd) ? 1.0L : 0.0L);
+    }
+    case ZttIntegerRoundingMode::Rdn:
+        return lower;
+    case ZttIntegerRoundingMode::Rod: {
+        const bool lowerIsOdd = std::fmod(std::fabs(lower), 2.0L) == 1.0L;
+        return lower + (fraction != 0.0L && !lowerIsOdd ? 1.0L : 0.0L);
+    }
+    }
+    return lower;
+}
+
+inline unsigned __int128
+zttElemBitwise(unsigned __int128 lhs, unsigned __int128 rhs,
+               const ZttTypeInfo &type, ZttElemwiseOp op)
+{
+    const unsigned __int128 mask = zttBitMask128(type.bits);
+    lhs &= mask;
+    rhs &= mask;
+    switch (op) {
+    case ZttElemwiseOp::And: return lhs & rhs;
+    case ZttElemwiseOp::AndNot: return lhs & ~rhs & mask;
+    case ZttElemwiseOp::Or: return lhs | rhs;
+    case ZttElemwiseOp::OrNot: return lhs | (~rhs & mask);
+    case ZttElemwiseOp::Xor: return lhs ^ rhs;
+    default: return lhs;
+    }
+}
+
+inline unsigned __int128
+zttSoftFloatNegate(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    return raw ^ (static_cast<unsigned __int128>(1) << (type.bits - 1));
+}
+
+inline unsigned __int128
+zttSoftFloatCanonicalizeNaN(unsigned __int128 raw,
+                            const ZttTypeInfo &type)
+{
+    return zttSoftFloatIsNaN(raw, type) ?
+        zttSoftFloatCanonicalNaN(type) : raw;
+}
+
+inline bool
+zttTrySoftFloatElement(
+    ZttFpEnv &fpEnv, unsigned __int128 a, unsigned __int128 b,
+    unsigned __int128 old, const ZttTypeInfo &destType,
+    const ZttTypeInfo &lhsType, const ZttTypeInfo &rhsType,
+    ZttElemwiseOp op, unsigned __int128 &result)
+{
+    if (op == ZttElemwiseOp::CmpGe || op == ZttElemwiseOp::CmpLt) {
+        if (!zttIsSoftFloatType(lhsType) ||
+            !zttIsSoftFloatType(rhsType))
+            return false;
+        const ZttTypeInfo *compareType = nullptr;
+        if (zttSoftFloatCanWiden(rhsType, lhsType))
+            compareType = &lhsType;
+        else if (zttSoftFloatCanWiden(lhsType, rhsType))
+            compareType = &rhsType;
+        if (!compareType)
+            return false;
+        const auto av = zttSoftFloatConvert(a, lhsType, *compareType, fpEnv);
+        const auto bv = zttSoftFloatConvert(b, rhsType, *compareType, fpEnv);
+        const bool unordered = zttSoftFloatIsNaN(av, *compareType) ||
+                               zttSoftFloatIsNaN(bv, *compareType);
+        const bool comparison = !unordered &&
+            (op == ZttElemwiseOp::CmpGe ?
+                zttSoftFloatLessEqual(bv, av, *compareType) :
+                zttSoftFloatLess(av, bv, *compareType));
+        result = comparison ? zttBitMask128(destType.bits) : 0;
+        return true;
+    }
+
+    if (op == ZttElemwiseOp::CmovGe || op == ZttElemwiseOp::CmovLt ||
+        op == ZttElemwiseOp::SelectGe ||
+        op == ZttElemwiseOp::SelectLt) {
+        if (!zttIsSoftFloatType(lhsType))
+            return false;
+        if (zttSoftFloatIsSignalingNaN(a, lhsType))
+            zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+        const bool unordered = zttSoftFloatIsNaN(a, lhsType);
+        const bool less = !unordered && zttSoftFloatLess(a, 0, lhsType);
+        const bool greaterEqual = !unordered &&
+            zttSoftFloatLessEqual(0, a, lhsType);
+        const bool take =
+            (op == ZttElemwiseOp::CmovGe ||
+             op == ZttElemwiseOp::SelectGe) ? greaterEqual : less;
+        if (op == ZttElemwiseOp::CmovGe ||
+            op == ZttElemwiseOp::CmovLt)
+            result = take ? b : old;
+        else
+            result = take ? b : 0;
+        return true;
+    }
+
+    if (op == ZttElemwiseOp::FrintM || op == ZttElemwiseOp::FrintN ||
+        op == ZttElemwiseOp::FrintP || op == ZttElemwiseOp::FrintZ) {
+        if (!zttIsSoftFloatType(lhsType) ||
+            !zttIsSoftFloatType(destType))
+            return false;
+        ZttRoundingMode rounding = ZttRoundingMode::Rne;
+        if (op == ZttElemwiseOp::FrintM)
+            rounding = ZttRoundingMode::Rdn;
+        else if (op == ZttElemwiseOp::FrintP)
+            rounding = ZttRoundingMode::Rup;
+        else if (op == ZttElemwiseOp::FrintZ)
+            rounding = ZttRoundingMode::Rtz;
+        const auto integral =
+            zttSoftFloatRoundToInt(a, lhsType, rounding, fpEnv);
+        result = zttSoftFloatConvert(integral, lhsType, destType, fpEnv);
+        return true;
+    }
+
+    if (!zttSoftFloatCompatible(lhsType, destType) ||
+        !zttSoftFloatCompatible(rhsType, destType))
+        return false;
+
+    const auto av = zttSoftFloatConvert(a, lhsType, destType, fpEnv);
+    const auto bv = zttSoftFloatConvert(b, rhsType, destType, fpEnv);
+    const auto oldv = old & zttBitMask128(destType.bits);
+    switch (op) {
+    case ZttElemwiseOp::Abs:
+        result = av & ~(static_cast<unsigned __int128>(1) <<
+                        (destType.bits - 1));
+        break;
+    case ZttElemwiseOp::AbsDiff:
+        result = zttSoftFloatBinary(
+            av, bv, destType, ZttSoftBinaryOp::Sub, fpEnv);
+        result &= ~(static_cast<unsigned __int128>(1) <<
+                    (destType.bits - 1));
+        break;
+    case ZttElemwiseOp::Broadcast:
+        result = av;
+        break;
+    case ZttElemwiseOp::Add:
+        result = zttSoftFloatBinary(
+            av, bv, destType, ZttSoftBinaryOp::Add, fpEnv);
+        break;
+    case ZttElemwiseOp::Sub:
+        result = zttSoftFloatBinary(
+            bv, av, destType, ZttSoftBinaryOp::Sub, fpEnv);
+        break;
+    case ZttElemwiseOp::HalfDiff:
+    case ZttElemwiseOp::Mean:
+        if (!zttIsNarrowFloatType(destType) ||
+            !zttSameFloatEncoding(lhsType, destType) ||
+            !zttSameFloatEncoding(rhsType, destType)) {
+            return false;
+        }
+        fpEnv.setRounding(destType.rounding);
+        result = RiscvISA::ZttFloatBackend::halfSum(
+            static_cast<uint16_t>(av), static_cast<uint16_t>(bv),
+            zttNarrowFloatFormat(destType),
+            zttBackendRounding(destType.rounding),
+            op == ZttElemwiseOp::HalfDiff);
+        break;
+    case ZttElemwiseOp::Max:
+        result = zttSameTypeMaxMin(av, bv, destType, true, fpEnv);
+        break;
+    case ZttElemwiseOp::Min:
+        result = zttSameTypeMaxMin(av, bv, destType, false, fpEnv);
+        break;
+    case ZttElemwiseOp::Mul:
+        result = zttSoftFloatBinary(
+            av, bv, destType, ZttSoftBinaryOp::Mul, fpEnv);
+        break;
+    case ZttElemwiseOp::MulAcc:
+        result = zttSoftFloatMulAdd(av, bv, oldv, destType, fpEnv);
+        break;
+    case ZttElemwiseOp::MulAccNeg:
+        result = zttSoftFloatMulAdd(
+            zttSoftFloatNegate(av, destType), bv, oldv, destType, fpEnv);
+        break;
+    case ZttElemwiseOp::MulAdd:
+        result = zttSoftFloatMulAdd(bv, oldv, av, destType, fpEnv);
+        break;
+    case ZttElemwiseOp::MulNeg:
+        result = zttSoftFloatNegate(
+            zttSoftFloatBinary(
+                av, bv, destType, ZttSoftBinaryOp::Mul, fpEnv),
+            destType);
+        break;
+    case ZttElemwiseOp::MulSub:
+        result = zttSoftFloatMulAdd(
+            zttSoftFloatNegate(bv, destType), oldv, av, destType, fpEnv);
+        break;
+    case ZttElemwiseOp::Rec:
+        result = zttSoftFloatBinary(
+            zttFloatOne(destType),
+            av, destType, ZttSoftBinaryOp::Div, fpEnv);
+        break;
+    case ZttElemwiseOp::Rsqrt: {
+        const auto root = zttSoftFloatSqrt(av, destType, fpEnv);
+        result = zttSoftFloatBinary(
+            zttFloatOne(destType),
+            root, destType, ZttSoftBinaryOp::Div, fpEnv);
+        break;
+    }
+    case ZttElemwiseOp::Sqrt:
+        result = zttSoftFloatSqrt(av, destType, fpEnv);
+        break;
+    default:
+        return false;
+    }
+    result = zttSoftFloatCanonicalizeNaN(result, destType);
+    return true;
+}
+
+inline void
+zttExecuteElementwise(ExecContext *xc, ZttFpEnv &fpEnv,
+                      RiscvISA::MatRegContainer &dest,
+                      const RiscvISA::MatRegContainer &lhs,
+                      const RiscvISA::MatRegContainer &rhs,
+                      const ZttTypeInfo &destType, const ZttTypeInfo &lhsType,
+                      const ZttTypeInfo &rhsType, uint32_t len,
+                      ZttElemwiseOp op, bool scalarValid, RegVal scalar,
+                      bool scalarLeft = false)
+{
+    if (!len || !zttTypeCanExecute(destType) ||
+        !zttTypeCanExecute(lhsType) || !zttTypeCanExecute(rhsType)) {
+        zttSetUnsupported(xc);
+        return;
+    }
+    ZttTypeInfo scalarTypeStorage;
+    const ZttTypeInfo &scalarType = scalarLeft ? lhsType : rhsType;
+    if (scalarValid && scalarLeft &&
+        (op == ZttElemwiseOp::Ldexp || op == ZttElemwiseOp::LdexpAcc)) {
+        auto *isa = static_cast<RiscvISA::ISA *>(
+            xc->tcBase()->getIsaPtr());
+        if (!zttDecodeType(xc, isa->ameMaxIntDtype(), scalarTypeStorage) ||
+            scalarTypeStorage.isFloating) {
+            zttSetUnsupported(xc);
+            return;
+        }
+    }
+    const ZttTypeInfo &effectiveScalarType = scalarValid && scalarLeft &&
+        (op == ZttElemwiseOp::Ldexp || op == ZttElemwiseOp::LdexpAcc) ?
+        scalarTypeStorage : scalarType;
+    const bool fixedExponent = scalarValid && scalarLeft &&
+        (op == ZttElemwiseOp::Ldexp || op == ZttElemwiseOp::LdexpAcc);
+    const unsigned __int128 sourceScalarRaw =
+        zttScalarRaw(xc, scalar, effectiveScalarType);
+    const ZttWideInt scalarExponent = fixedExponent ?
+        zttWideInteger(sourceScalarRaw, effectiveScalarType) : ZttWideInt(0);
+    unsigned __int128 scalarRaw = sourceScalarRaw;
+    if (scalarValid && scalarLeft) {
+        scalarRaw = (op == ZttElemwiseOp::Ldexp ||
+                     op == ZttElemwiseOp::LdexpAcc) ? sourceScalarRaw :
+            zttConvertElement(sourceScalarRaw, effectiveScalarType, rhsType,
+                              xc, fpEnv);
+    }
+    const ZttTypeInfo &effectiveLhsType =
+        scalarValid && scalarLeft ? rhsType : lhsType;
+    for (uint32_t row = 0; row < len; ++row) {
+        for (uint32_t col = 0; col < len; ++col) {
+            const unsigned __int128 matrixA = zttReadTileElement(
+                lhs, lhsType, len, row, col);
+            const unsigned __int128 matrixB = zttReadTileElement(
+                rhs, rhsType, len, row, col);
+            const unsigned __int128 a = fixedExponent ? matrixA :
+                (scalarValid && scalarLeft ? scalarRaw : matrixA);
+            const unsigned __int128 b = scalarValid && !scalarLeft ?
+                scalarRaw : matrixB;
+            const bool readsDest = op == ZttElemwiseOp::CmovGe ||
+                op == ZttElemwiseOp::CmovLt ||
+                op == ZttElemwiseOp::LdexpAcc ||
+                op == ZttElemwiseOp::MulAcc ||
+                op == ZttElemwiseOp::MulAccNeg ||
+                op == ZttElemwiseOp::MulAdd ||
+                op == ZttElemwiseOp::MulSub ||
+                op == ZttElemwiseOp::RdexpAcc;
+            const unsigned __int128 old = readsDest ? zttReadTileElement(
+                dest, destType, len, row, col) : 0;
+            unsigned __int128 softResult;
+            if (!destType.isFloating && !effectiveLhsType.isFloating &&
+                !rhsType.isFloating) {
+                unsigned __int128 integerResult;
+                if (zttExecuteIntegerElement(
+                        xc, fpEnv, a, b, old, destType, effectiveLhsType,
+                        rhsType, op, integerResult,
+                        fixedExponent ? &scalarExponent : nullptr)) {
+                    zttWriteTileElement(
+                        dest, destType, len, row, col, integerResult);
+                    continue;
+                }
+            }
+            const bool scaleOp = op == ZttElemwiseOp::Ldexp ||
+                op == ZttElemwiseOp::LdexpAcc ||
+                op == ZttElemwiseOp::Rdexp ||
+                op == ZttElemwiseOp::RdexpAcc;
+            if (scaleOp && zttIsNarrowFloatType(destType)) {
+                const bool leftScale = op == ZttElemwiseOp::Ldexp ||
+                    op == ZttElemwiseOp::LdexpAcc;
+                const auto scaleRaw = scalarValid && leftScale ? b : a;
+                const ZttTypeInfo &scaleType =
+                    scalarValid && leftScale ? rhsType : effectiveLhsType;
+                if (zttSameFloatEncoding(scaleType, destType)) {
+                    ZttWideInt exponent = fixedExponent ? scalarExponent :
+                        zttWideInteger(b, rhsType);
+                    if (!leftScale)
+                        exponent = -exponent;
+                    fpEnv.setRounding(destType.rounding);
+                    const int narrowExponent =
+                        zttNarrowScaleExponent(exponent);
+                    if (op == ZttElemwiseOp::LdexpAcc ||
+                        op == ZttElemwiseOp::RdexpAcc) {
+                        softResult = RiscvISA::ZttFloatBackend::scaleAdd(
+                            static_cast<uint16_t>(scaleRaw), narrowExponent,
+                            static_cast<uint16_t>(old),
+                            zttNarrowFloatFormat(destType),
+                            zttBackendRounding(destType.rounding));
+                    } else {
+                        softResult = RiscvISA::ZttFloatBackend::scale(
+                            static_cast<uint16_t>(scaleRaw), narrowExponent,
+                            zttNarrowFloatFormat(destType),
+                            zttBackendRounding(destType.rounding));
+                    }
+                    zttWriteTileElement(
+                        dest, destType, len, row, col, softResult);
+                    continue;
+                }
+            }
+            if (zttTrySoftFloatElement(
+                    fpEnv, a, b, old, destType, effectiveLhsType, rhsType,
+                    op, softResult)) {
+                zttWriteTileElement(
+                    dest, destType, len, row, col, softResult);
+                continue;
+            }
+            if (zttSoftFloatIsSignalingNaN(a, effectiveLhsType) ||
+                zttSoftFloatIsSignalingNaN(b, rhsType) ||
+                (readsDest &&
+                 zttSoftFloatIsSignalingNaN(old, destType)))
+                zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+            const long double av = zttElemNumeric(a, effectiveLhsType);
+            const long double bv = zttElemNumeric(b, rhsType);
+            const long double oldv = zttElemNumeric(old, destType);
+            const bool inputNaN = std::isnan(av) || std::isnan(bv) ||
+                                  (readsDest && std::isnan(oldv));
+            long double value = av;
+            bool comparison = false;
+            switch (op) {
+            case ZttElemwiseOp::Abs: value = std::fabs(av); break;
+            case ZttElemwiseOp::AbsDiff: value = std::fabs(av - bv); break;
+            case ZttElemwiseOp::Broadcast: value = av; break;
+            case ZttElemwiseOp::Add: value = av + bv; break;
+            case ZttElemwiseOp::Sub: value = bv - av; break;
+            case ZttElemwiseOp::HalfDiff:
+                value = (bv - av) / 2.0L;
+                if (!destType.isFloating)
+                    value = zttRoundIntegerFraction(
+                        value, destType.integerRounding);
+                break;
+            case ZttElemwiseOp::Mean:
+                value = (av + bv) / 2.0L;
+                if (!destType.isFloating)
+                    value = zttRoundIntegerFraction(
+                        value, destType.integerRounding);
+                break;
+            case ZttElemwiseOp::Max:
+                zttWriteTileElement(dest, destType, len, row, col,
+                    zttSameTypeMaxMin(a, b, destType, true, fpEnv));
+                continue;
+            case ZttElemwiseOp::Min:
+                zttWriteTileElement(dest, destType, len, row, col,
+                    zttSameTypeMaxMin(a, b, destType, false, fpEnv));
+                continue;
+            case ZttElemwiseOp::Mul: value = av * bv; break;
+            case ZttElemwiseOp::MulAcc: value = oldv + av * bv; break;
+            case ZttElemwiseOp::MulAccNeg: value = oldv - av * bv; break;
+            case ZttElemwiseOp::MulAdd: value = av + bv * oldv; break;
+            case ZttElemwiseOp::MulNeg: value = -(av * bv); break;
+            case ZttElemwiseOp::MulSub: value = av - bv * oldv; break;
+            case ZttElemwiseOp::Ldexp: {
+                const ZttWideInt exponent = fixedExponent ? scalarExponent :
+                    zttWideInteger(b, rhsType);
+                value = zttScaleFloat(fixedExponent ? bv : av, exponent);
+                break;
+            }
+            case ZttElemwiseOp::LdexpAcc: {
+                const ZttWideInt exponent = fixedExponent ? scalarExponent :
+                    zttWideInteger(b, rhsType);
+                value = oldv + zttScaleFloat(
+                    fixedExponent ? bv : av, exponent);
+                break;
+            }
+            case ZttElemwiseOp::Rdexp: {
+                const ZttWideInt exponent = fixedExponent ? scalarExponent :
+                    zttWideInteger(b, rhsType);
+                value = zttScaleFloat(av, -exponent);
+                break;
+            }
+            case ZttElemwiseOp::RdexpAcc: {
+                const ZttWideInt exponent = fixedExponent ? scalarExponent :
+                    zttWideInteger(b, rhsType);
+                value = oldv + zttScaleFloat(av, -exponent);
+                break;
+            }
+            case ZttElemwiseOp::Exp2: value = std::exp2(av); break;
+            case ZttElemwiseOp::Cos: value = std::cos(av); break;
+            case ZttElemwiseOp::Rec:
+                if (lhsType.isFloating && av == 0.0L)
+                    zttAccrueFpFlags(fpEnv, ZttFpFlagDZ);
+                value = 1.0L / av;
+                break;
+            case ZttElemwiseOp::Rsqrt:
+                if (lhsType.isFloating && av == 0.0L)
+                    zttAccrueFpFlags(fpEnv, ZttFpFlagDZ);
+                value = 1.0L / std::sqrt(av);
+                break;
+            case ZttElemwiseOp::Sin: value = std::sin(av); break;
+            case ZttElemwiseOp::Sqrt: value = std::sqrt(av); break;
+            case ZttElemwiseOp::Tanh: value = std::tanh(av); break;
+            case ZttElemwiseOp::FrintM: value = std::floor(av); break;
+            case ZttElemwiseOp::FrintN: value = std::nearbyint(av); break;
+            case ZttElemwiseOp::FrintP: value = std::ceil(av); break;
+            case ZttElemwiseOp::FrintZ: value = std::trunc(av); break;
+            case ZttElemwiseOp::Log2:
+                if (lhsType.isFloating && av == 0.0L)
+                    zttAccrueFpFlags(fpEnv, ZttFpFlagDZ);
+                value = std::log2(av);
+                break;
+            case ZttElemwiseOp::Log2Sub:
+                if ((scalarValid ? bv : av) == 0.0L)
+                    zttAccrueFpFlags(fpEnv, ZttFpFlagDZ);
+                value = scalarValid ? std::log2(std::fabs(bv)) - av :
+                                      std::log2(std::fabs(av)) - bv;
+                break;
+            case ZttElemwiseOp::SubLog2:
+                if ((scalarValid ? bv : av) == 0.0L)
+                    zttAccrueFpFlags(fpEnv, ZttFpFlagDZ);
+                value = scalarValid ? av - std::log2(std::fabs(bv)) :
+                                      bv - std::log2(std::fabs(av));
+                break;
+            case ZttElemwiseOp::CmovGe:
+                zttWriteTileElement(dest, destType, len, row, col,
+                    av >= 0.0L ? b : old);
+                continue;
+            case ZttElemwiseOp::CmovLt:
+                zttWriteTileElement(dest, destType, len, row, col,
+                    av < 0.0L ? b : old);
+                continue;
+            case ZttElemwiseOp::SelectGe:
+                zttWriteTileElement(dest, destType, len, row, col,
+                    av >= 0.0L ? b : 0);
+                continue;
+            case ZttElemwiseOp::SelectLt:
+                zttWriteTileElement(dest, destType, len, row, col,
+                    av < 0.0L ? b : 0);
+                continue;
+            case ZttElemwiseOp::CmpGe: comparison = av >= bv; break;
+            case ZttElemwiseOp::CmpLt: comparison = av < bv; break;
+            case ZttElemwiseOp::And: case ZttElemwiseOp::AndNot:
+            case ZttElemwiseOp::Or: case ZttElemwiseOp::OrNot:
+            case ZttElemwiseOp::Xor:
+                zttWriteTileElement(dest, destType, len, row, col,
+                    zttElemBitwise(a, b, destType, op));
+                continue;
+            case ZttElemwiseOp::Shift:
+            case ZttElemwiseOp::ShiftLeft:
+            case ZttElemwiseOp::ShiftRightArithmetic:
+            case ZttElemwiseOp::ShiftRightLogical: {
+                const unsigned shift = static_cast<unsigned>(bv) &
+                    (destType.bits - 1);
+                const unsigned __int128 bits = a &
+                    zttBitMask128(destType.bits);
+                if (op == ZttElemwiseOp::ShiftLeft)
+                    value = static_cast<long double>(bits << shift);
+                else if (op == ZttElemwiseOp::ShiftRightLogical)
+                    value = static_cast<long double>(bits >> shift);
+                else
+                    value = static_cast<long double>(
+                        zttElemNegative(a, destType) ?
+                        (zttSignedValue(a, destType.bits) >> shift) :
+                        (bits >> shift));
+                break;
+            }
+            default: break;
+            }
+            if (destType.isFloating && std::isnan(value) && !inputNaN)
+                zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+            if (op == ZttElemwiseOp::CmpGe ||
+                op == ZttElemwiseOp::CmpLt)
+                zttWriteTileElement(dest, destType, len, row, col,
+                    comparison ? zttBitMask128(destType.bits) : 0);
+            else
+                zttWriteTileElement(dest, destType, len, row, col,
+                    zttElemEncode(value, destType, fpEnv));
+        }
+    }
+}
+
+inline void
+zttExecuteShift(RiscvISA::MatRegContainer &dest,
+                const RiscvISA::MatRegContainer &src,
+                const ZttTypeInfo &destType, const ZttTypeInfo &srcType,
+                uint32_t len, int32_t shift)
+{
+    RiscvISA::MatRegContainer copy = src;
+    dest.zero();
+    for (uint32_t row = 0; row < len; ++row) {
+        for (uint32_t col = 0; col < len; ++col) {
+            const int32_t sourceCol = static_cast<int32_t>(col) + shift;
+            if (sourceCol < 0 || sourceCol >= static_cast<int32_t>(len))
+                continue;
+            const auto value = zttReadTileElement(
+                copy, srcType, len, row, static_cast<uint32_t>(sourceCol));
+            zttWriteTileElement(dest, destType, len, row, col, value);
+        }
+    }
+}
+
+inline void
+zttExecuteUnary(ExecContext *xc, ZttFpEnv &fpEnv,
+                RiscvISA::MatRegContainer &dest,
+                const RiscvISA::MatRegContainer &src,
+                const ZttTypeInfo &destType, const ZttTypeInfo &srcType,
+                uint32_t len, ZttElemwiseOp op)
+{
+    zttExecuteElementwise(xc, fpEnv, dest, src, src, destType, srcType,
+                          srcType, len, op, false, 0);
+}
+
+inline void
+zttExecuteReduce(ExecContext *xc, ZttFpEnv &fpEnv,
+                 RiscvISA::MatRegContainer &dest,
+                 const RiscvISA::MatRegContainer &src,
+                 const ZttTypeInfo &destType, const ZttTypeInfo &srcType,
+                 uint32_t len, ZttElemwiseOp op, bool column)
+{
+    for (uint32_t outer = 0; outer < len; ++outer) {
+        unsigned __int128 running = 0;
+        for (uint32_t inner = 0; inner < len; ++inner) {
+            const uint32_t row = column ? inner : outer;
+            const uint32_t col = column ? outer : inner;
+            const auto raw = zttReadTileElement(src, srcType, len, row, col);
+            const auto converted =
+                zttConvertElement(raw, srcType, destType, xc, fpEnv);
+            if (!inner) {
+                running = converted;
+            } else if (op == ZttElemwiseOp::ReduceAddCol ||
+                       op == ZttElemwiseOp::ReduceAddRow) {
+                running = zttSameTypeAdd(
+                    running, converted, destType, fpEnv);
+            } else {
+                const bool maximum = op == ZttElemwiseOp::ReduceMaxCol ||
+                                     op == ZttElemwiseOp::ReduceMaxRow;
+                running = zttSameTypeMaxMin(
+                    running, converted, destType, maximum, fpEnv);
+            }
+        }
+        for (uint32_t inner = 0; inner < len; ++inner) {
+            const uint32_t row = column ? inner : outer;
+            const uint32_t col = column ? outer : inner;
+            zttWriteTileElement(dest, destType, len, row, col, running);
+        }
+    }
+}
+
+inline void
+zttExecutePrefix(ExecContext *xc, ZttFpEnv &fpEnv,
+                 RiscvISA::MatRegContainer &dest,
+                 const RiscvISA::MatRegContainer &src,
+                 const ZttTypeInfo &destType, const ZttTypeInfo &srcType,
+                 uint32_t len, ZttElemwiseOp op, bool column)
+{
+    RiscvISA::MatRegContainer copy = src;
+    for (uint32_t outer = 0; outer < len; ++outer) {
+        unsigned __int128 running = 0;
+        for (uint32_t inner = 0; inner < len; ++inner) {
+            const uint32_t row = column ? inner : outer;
+            const uint32_t col = column ? outer : inner;
+            const auto converted = zttConvertElement(
+                zttReadTileElement(copy, srcType, len, row, col),
+                srcType, destType, xc, fpEnv);
+            if (!inner) {
+                running = converted;
+            } else if (op == ZttElemwiseOp::PrefixAddCol ||
+                       op == ZttElemwiseOp::PrefixAddRow) {
+                running = zttSameTypeAdd(
+                    running, converted, destType, fpEnv);
+            } else {
+                running = zttSameTypeMaxMin(
+                    running, converted, destType, true, fpEnv);
+            }
+            zttWriteTileElement(
+                dest, destType, len, row, col, running);
+        }
+    }
+}
+
+inline void
+zttExecutePermutation(ExecContext *xc, RiscvISA::MatRegContainer &dest,
+                      const RiscvISA::MatRegContainer &lhs,
+                      const RiscvISA::MatRegContainer &rhs,
+                      const ZttTypeInfo &destType, const ZttTypeInfo &lhsType,
+                      const ZttTypeInfo &rhsType, uint32_t len,
+                      ZttElemwiseOp op)
+{
+    RiscvISA::MatRegContainer lhsCopy = lhs;
+    RiscvISA::MatRegContainer rhsCopy = rhs;
+    if (!len) {
+        zttSetUnsupported(xc);
+        return;
+    }
+    for (uint32_t row = 0; row < len; ++row) {
+        for (uint32_t col = 0; col < len; ++col) {
+            uint32_t sourceRow = row;
+            uint32_t sourceCol = col;
+            const auto index = zttReadTileElement(rhsCopy, rhsType, len,
+                                                  row, col);
+            switch (op) {
+            case ZttElemwiseOp::ColZip:
+                sourceCol = col / 2 + (col & 1) * (len / 2);
+                break;
+            case ZttElemwiseOp::ColUnzip:
+                sourceCol = (col * 2) % len + col / (len / 2);
+                break;
+            case ZttElemwiseOp::RowZip:
+                sourceRow = row * 2 + (col & 1);
+                sourceCol = col / 2;
+                break;
+            case ZttElemwiseOp::RowUnzip:
+                sourceRow = row / 2;
+                sourceCol = col * 2 + (row & 1);
+                break;
+            case ZttElemwiseOp::Gather:
+                sourceCol = static_cast<uint32_t>(index) & (len - 1);
+                break;
+            case ZttElemwiseOp::GatherRow:
+                sourceRow = static_cast<uint32_t>(index) & (len - 1);
+                break;
+            default:
+                break;
+            }
+            if (sourceRow >= len || sourceCol >= len) {
+                zttSetUnsupported(xc);
+                continue;
+            }
+            zttWriteTileElement(dest, destType, len, row, col,
+                zttReadTileElement(lhsCopy, lhsType, len,
+                                   sourceRow, sourceCol));
+        }
+    }
+}
+
+inline void
+zttExecuteScatter(ExecContext *xc, ZttFpEnv &fpEnv,
+                  RiscvISA::MatRegContainer &dest,
+                  const RiscvISA::MatRegContainer &values,
+                  const RiscvISA::MatRegContainer &indices,
+                  const ZttTypeInfo &destType,
+                  const ZttTypeInfo &valueType,
+                  const ZttTypeInfo &indexType, uint32_t len,
+                  ZttElemwiseOp op, bool column)
+{
+    RiscvISA::MatRegContainer valueCopy = values;
+    RiscvISA::MatRegContainer indexCopy = indices;
+    for (uint32_t row = 0; row < len; ++row) {
+        for (uint32_t col = 0; col < len; ++col) {
+            const uint32_t index = static_cast<uint32_t>(zttReadTileElement(
+                indexCopy, indexType, len, row, col)) & (len - 1);
+            const uint32_t destRow = column ? index : row;
+            const uint32_t destCol = column ? col : index;
+            const auto source = zttReadTileElement(
+                valueCopy, valueType, len, row, col);
+            const auto current = zttReadTileElement(
+                dest, destType, len, destRow, destCol);
+            const bool maximum = op == ZttElemwiseOp::ScatterMaxCol ||
+                                 op == ZttElemwiseOp::ScatterMaxRow;
+            unsigned __int128 result;
+            if (maximum) {
+                if (destType.isFloating) {
+                    if (valueType.isFloating &&
+                        valueType.kind == destType.kind &&
+                        valueType.bits == destType.bits) {
+                        result = zttSameTypeMaxMin(
+                            current, source, destType, true, fpEnv);
+                    } else {
+                        const bool currentNaN = zttSoftFloatIsNaN(
+                            current, destType);
+                        const bool sourceNaN = valueType.isFloating &&
+                            zttSoftFloatIsNaN(source, valueType);
+                        if (currentNaN || sourceNaN) {
+                            if ((currentNaN && zttSoftFloatIsSignalingNaN(
+                                    current, destType)) ||
+                                (sourceNaN && zttSoftFloatIsSignalingNaN(
+                                    source, valueType)))
+                                zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+                            result = zttSoftFloatCanonicalNaN(destType);
+                        } else {
+                            const long double currentValue =
+                                zttElemNumeric(current, destType);
+                            const long double sourceValue =
+                                zttElemNumeric(source, valueType);
+                            if (currentValue == 0.0L &&
+                                sourceValue == 0.0L)
+                                result = 0;
+                            else
+                                result = currentValue >= sourceValue ?
+                                    current : zttConvertElement(
+                                        source, valueType, destType, xc,
+                                        fpEnv);
+                        }
+                    }
+                } else if (!valueType.isFloating) {
+                    const ZttWideInt currentValue =
+                        zttWideInteger(current, destType);
+                    const ZttWideInt sourceValue =
+                        zttWideInteger(source, valueType);
+                    result = currentValue >= sourceValue ? current :
+                        zttConvertElement(source, valueType, destType,
+                                          xc, fpEnv);
+                } else {
+                    const long double currentValue =
+                        zttElemNumeric(current, destType);
+                    const long double sourceValue =
+                        zttElemNumeric(source, valueType);
+                    if (std::isnan(sourceValue) || std::isnan(currentValue)) {
+                        zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+                        result = zttWideToRaw(ZttWideInt(0), destType, fpEnv);
+                    } else {
+                        result = currentValue >= sourceValue ? current :
+                            zttConvertElement(source, valueType, destType,
+                                              xc, fpEnv);
+                    }
+                }
+            } else if (destType.isFloating) {
+                if (valueType.isFloating &&
+                    valueType.kind == destType.kind &&
+                    valueType.bits == destType.bits) {
+                    result = zttSameTypeAdd(current, source, destType, fpEnv);
+                } else {
+                    if (zttFloatIsSignalingNaN(current, destType) ||
+                        (valueType.isFloating &&
+                         zttFloatIsSignalingNaN(source, valueType)))
+                        zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+                    result = zttRoundFloat(
+                        zttElemNumeric(current, destType) +
+                        zttElemNumeric(source, valueType), destType, &fpEnv);
+                }
+            } else if (!valueType.isFloating) {
+                result = zttWideToRaw(
+                    zttWideInteger(current, destType) +
+                    zttWideInteger(source, valueType), destType, fpEnv);
+            } else {
+                long double sum = zttElemNumeric(current, destType) +
+                                  zttElemNumeric(source, valueType);
+                const long double lower = std::floor(sum);
+                const long double fraction = sum - lower;
+                switch (destType.integerRounding) {
+                case ZttIntegerRoundingMode::Rnu:
+                    sum = lower + (fraction >= 0.5L ? 1.0L : 0.0L);
+                    break;
+                case ZttIntegerRoundingMode::Rne:
+                    sum = lower + (fraction > 0.5L ||
+                        (fraction == 0.5L &&
+                         std::fmod(std::fabs(lower), 2.0L) == 1.0L) ?
+                        1.0L : 0.0L);
+                    break;
+                case ZttIntegerRoundingMode::Rdn:
+                    sum = lower;
+                    break;
+                case ZttIntegerRoundingMode::Rod:
+                    sum = lower + (fraction != 0.0L &&
+                        std::fmod(std::fabs(lower), 2.0L) != 1.0L ?
+                        1.0L : 0.0L);
+                    break;
+                }
+                result = zttElemInteger(sum, destType, fpEnv);
+            }
+            zttWriteTileElement(dest, destType, len, destRow, destCol,
+                                result);
+        }
+    }
+}
+
+inline void
+zttExecuteRowZip(RiscvISA::MatRegContainer &dest,
+                 RiscvISA::MatRegContainer &destNext,
+                 const RiscvISA::MatRegContainer &lhs,
+                 const RiscvISA::MatRegContainer &rhs,
+                 const ZttTypeInfo &destType, const ZttTypeInfo &lhsType,
+                 const ZttTypeInfo &rhsType, uint32_t len)
+{
+    RiscvISA::MatRegContainer lhsCopy = lhs;
+    RiscvISA::MatRegContainer rhsCopy = rhs;
+    for (uint32_t logicalRow = 0; logicalRow < 2 * len; ++logicalRow) {
+        auto &output = logicalRow < len ? dest : destNext;
+        const uint32_t outputRow = logicalRow % len;
+        const bool takeRhs = logicalRow & 1;
+        const uint32_t sourceRow = logicalRow / 2;
+        for (uint32_t col = 0; col < len; ++col) {
+            const auto raw = zttReadTileElement(
+                takeRhs ? rhsCopy : lhsCopy,
+                takeRhs ? rhsType : lhsType, len, sourceRow, col);
+            zttWriteTileElement(output, destType, len, outputRow, col,
+                                raw);
+        }
+    }
+}
+
+inline void
+zttExecuteRowUnzip(RiscvISA::MatRegContainer &dest,
+                   RiscvISA::MatRegContainer &destNext,
+                   const RiscvISA::MatRegContainer &src,
+                   const RiscvISA::MatRegContainer &srcNext,
+                   const ZttTypeInfo &destType, const ZttTypeInfo &srcType,
+                   uint32_t len)
+{
+    RiscvISA::MatRegContainer first = src;
+    RiscvISA::MatRegContainer second = srcNext;
+    for (uint32_t outputRow = 0; outputRow < len; ++outputRow) {
+        for (uint32_t odd = 0; odd < 2; ++odd) {
+            const uint32_t logicalRow = outputRow * 2 + odd;
+            const auto &input = logicalRow < len ? first : second;
+            const uint32_t inputRow = logicalRow % len;
+            auto &output = odd ? destNext : dest;
+            for (uint32_t col = 0; col < len; ++col) {
+                const auto raw = zttReadTileElement(
+                    input, srcType, len, inputRow, col);
+                zttWriteTileElement(output, destType, len, outputRow, col,
+                                    raw);
+            }
+        }
+    }
+}
+
+} // anonymous namespace
+}};
+
+let {{
+    def zttElemwiseBehaviour(op, scalar=False, unary=False):
+        setup = '''
+            ZttTypeInfo destType, lhsType, rhsType;
+            uint32_t len;
+        '''
+        if scalar:
+            setup += '''
+            if (!zttGetDatatype(xc, zttDest, false, zttDestType,
+                                destType) ||
+                !zttGetDatatype(xc, zttMatrix, false, zttMatrixType,
+                                rhsType) ||
+                !zttDecodeType(xc, xc->readMiscReg(MISCREG_AMESTYPE),
+                               lhsType) ||
+                !zttTileLen(xc, destType, len) ||
+                !zttTileLen(xc, rhsType, len))
+                return NoFault;
+            const RegVal zttScalarType =
+                xc->readMiscReg(MISCREG_AMESTYPE);
+            if (!zttValidateElementwiseTuple(
+                    xc, ZttElemwiseOp::%s, destType, lhsType, rhsType,
+                    zttDestType, zttScalarType, zttMatrixType, true))
+                return NoFault;
+            uint32_t destPack, matrixPack, destGroup, matrixGroup;
+            if (!zttPackFactor(xc, destType, destPack) ||
+                !zttPackFactor(xc, rhsType, matrixPack) ||
+                !zttGroupSize(xc, destType, destGroup) ||
+                !zttGroupSize(xc, rhsType, matrixGroup))
+                return NoFault;
+            const uint32_t squareCount = std::max(destPack, matrixPack);
+            uint32_t destSpan, matrixSpan;
+            const uint32_t destBase =
+                zttDest - RiscvISA::ZttMatRegBase;
+            const uint32_t matrixBase =
+                zttMatrix - RiscvISA::ZttMatRegBase;
+            if (!zttMSpan(destBase, squareCount, destPack, destGroup,
+                          destSpan) ||
+                !zttMSpan(matrixBase, squareCount, matrixPack, matrixGroup,
+                          matrixSpan))
+                return std::make_shared<IllegalInstFault>(
+                    "invalid AME scalar register span", machInst);
+            ZttMRegArray destSource{}, matrixSource{}, result{};
+            zttSnapshotMOperand(
+                xc, destBase, destSpan, zttDestReg, destSource);
+            zttSnapshotMOperand(
+                xc, matrixBase, matrixSpan, zttMatrixReg, matrixSource);
+            for (uint32_t i = 0; i < destSpan; ++i)
+                result[i].zero();
+            const uint64_t physicalBits = zttPhysicalMRegBits(xc, len);
+            const bool scalarLeft = true;
+            for (uint32_t square = 0; square < squareCount; ++square) {
+                auto destSquare = zttExtractMOperandSquare(
+                    destSource, physicalBits, destType, len, square);
+                const auto matrixSquare = zttExtractMOperandSquare(
+                    matrixSource, physicalBits, rhsType, len, square);
+                zttExecuteElementwise(
+                    xc, zttFpEnv, destSquare, matrixSquare, matrixSquare,
+                    destType, lhsType, rhsType, len, ZttElemwiseOp::%s,
+                    true, zttScalar, scalarLeft);
+                zttInsertMOperandSquare(
+                    result, physicalBits, destType, len, square,
+                    destSquare);
+            }
+            zttCommitMOperand(
+                xc, destBase, destSpan, result, zttDestReg);
+            ''' % (op, op)
+        elif unary:
+            setup += '''
+            if (!zttGetDatatype(xc, zttDest, false, zttDestType,
+                                destType) ||
+                !zttGetDatatype(xc, zttSrc, false, zttSrcType,
+                                lhsType) ||
+                !zttTileLen(xc, destType, len) ||
+                !zttTileLen(xc, lhsType, len))
+                return NoFault;
+            rhsType = lhsType;
+            if (!zttValidateElementwiseTuple(
+                    xc, ZttElemwiseOp::%s, destType, lhsType, rhsType,
+                    zttDestType, zttSrcType, zttSrcType, false))
+                return NoFault;
+            uint32_t destPack, srcPack, destGroup, srcGroup;
+            if (!zttPackFactor(xc, destType, destPack) ||
+                !zttPackFactor(xc, lhsType, srcPack) ||
+                !zttGroupSize(xc, destType, destGroup) ||
+                !zttGroupSize(xc, lhsType, srcGroup))
+                return NoFault;
+            const uint32_t squareCount = std::max(destPack, srcPack);
+            uint32_t destSpan, srcSpan;
+            const uint32_t destBase =
+                zttDest - RiscvISA::ZttMatRegBase;
+            const uint32_t srcBase =
+                zttSrc - RiscvISA::ZttMatRegBase;
+            if (!zttMSpan(destBase, squareCount, destPack, destGroup,
+                          destSpan) ||
+                !zttMSpan(srcBase, squareCount, srcPack, srcGroup,
+                          srcSpan))
+                return std::make_shared<IllegalInstFault>(
+                    "invalid AME unary register span", machInst);
+            ZttMRegArray srcSource{}, result{};
+            zttSnapshotMOperand(xc, srcBase, srcSpan, zttSrcReg, srcSource);
+            for (uint32_t i = 0; i < destSpan; ++i)
+                result[i].zero();
+            const uint64_t physicalBits = zttPhysicalMRegBits(xc, len);
+            for (uint32_t square = 0; square < squareCount; ++square) {
+                const auto srcSquare = zttExtractMOperandSquare(
+                    srcSource, physicalBits, lhsType, len, square);
+                RiscvISA::MatRegContainer destSquare;
+                destSquare.zero();
+                if (zttElemwiseIsReduce(ZttElemwiseOp::%s)) {
+                    const bool column = ZttElemwiseOp::%s ==
+                        ZttElemwiseOp::ReduceAddCol || ZttElemwiseOp::%s ==
+                        ZttElemwiseOp::ReduceMaxCol || ZttElemwiseOp::%s ==
+                        ZttElemwiseOp::ReduceMinCol;
+                    zttExecuteReduce(
+                        xc, zttFpEnv, destSquare, srcSquare, destType,
+                        lhsType, len, ZttElemwiseOp::%s, column);
+                } else if (zttElemwiseIsPrefix(ZttElemwiseOp::%s)) {
+                    const bool column = ZttElemwiseOp::%s ==
+                        ZttElemwiseOp::PrefixAddCol || ZttElemwiseOp::%s ==
+                        ZttElemwiseOp::PrefixMaxCol;
+                    zttExecutePrefix(
+                        xc, zttFpEnv, destSquare, srcSquare, destType,
+                        lhsType, len, ZttElemwiseOp::%s, column);
+                } else if (zttElemwiseIsPermutation(
+                               ZttElemwiseOp::%s)) {
+                    zttExecutePermutation(
+                        xc, destSquare, srcSquare, srcSquare, destType,
+                        lhsType, lhsType, len, ZttElemwiseOp::%s);
+                } else {
+                    zttExecuteUnary(
+                        xc, zttFpEnv, destSquare, srcSquare, destType,
+                        lhsType, len, ZttElemwiseOp::%s);
+                }
+                zttInsertMOperandSquare(
+                    result, physicalBits, destType, len, square,
+                    destSquare);
+            }
+            zttCommitMOperand(
+                xc, destBase, destSpan, result, zttDestReg);
+            ''' % tuple([op] * 13)
+        else:
+            setup += '''
+            if (!zttGetDatatype(xc, zttDest, false, zttDestType,
+                                destType) ||
+                !zttGetDatatype(xc, zttLhs, false, zttLhsType,
+                                lhsType) ||
+                !zttGetDatatype(xc, zttRhs, false, zttRhsType,
+                                rhsType) ||
+                !zttTileLen(xc, destType, len) ||
+                !zttTileLen(xc, lhsType, len) ||
+                !zttTileLen(xc, rhsType, len))
+                return NoFault;
+            if (!zttValidateElementwiseTuple(
+                    xc, ZttElemwiseOp::%s, destType, lhsType, rhsType,
+                    zttDestType, zttLhsType, zttRhsType, false))
+                return NoFault;
+            uint32_t destPack, lhsPack, rhsPack;
+            uint32_t destGroup, lhsGroup, rhsGroup;
+            if (!zttPackFactor(xc, destType, destPack) ||
+                !zttPackFactor(xc, lhsType, lhsPack) ||
+                !zttPackFactor(xc, rhsType, rhsPack) ||
+                !zttGroupSize(xc, destType, destGroup) ||
+                !zttGroupSize(xc, lhsType, lhsGroup) ||
+                !zttGroupSize(xc, rhsType, rhsGroup))
+                return NoFault;
+            const bool fixedSquareOp =
+                ZttElemwiseOp::%s == ZttElemwiseOp::Gather ||
+                ZttElemwiseOp::%s == ZttElemwiseOp::GatherRow ||
+                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddCol ||
+                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddRow ||
+                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxCol ||
+                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxRow;
+            if (fixedSquareOp &&
+                (destPack != 1 || lhsPack != 1 || rhsPack != 1 ||
+                 rhsType.isFloating)) {
+                zttSetUnsupported(xc);
+                return NoFault;
+            }
+            const bool exponentOp =
+                ZttElemwiseOp::%s == ZttElemwiseOp::Ldexp ||
+                ZttElemwiseOp::%s == ZttElemwiseOp::LdexpAcc ||
+                ZttElemwiseOp::%s == ZttElemwiseOp::Rdexp ||
+                ZttElemwiseOp::%s == ZttElemwiseOp::RdexpAcc;
+            if (exponentOp && rhsType.isFloating) {
+                zttSetUnsupported(xc);
+                return NoFault;
+            }
+            const uint32_t squareCount =
+                std::max(destPack, std::max(lhsPack, rhsPack));
+            uint32_t destSpan, lhsSpan, rhsSpan;
+            const uint32_t destBase =
+                zttDest - RiscvISA::ZttMatRegBase;
+            const uint32_t lhsBase =
+                zttLhs - RiscvISA::ZttMatRegBase;
+            const uint32_t rhsBase =
+                zttRhs - RiscvISA::ZttMatRegBase;
+            if (!zttMSpan(destBase, squareCount, destPack, destGroup,
+                          destSpan) ||
+                !zttMSpan(lhsBase, squareCount, lhsPack, lhsGroup,
+                          lhsSpan) ||
+                !zttMSpan(rhsBase, squareCount, rhsPack, rhsGroup,
+                          rhsSpan))
+                return std::make_shared<IllegalInstFault>(
+                    "invalid AME elementwise register span", machInst);
+            ZttMRegArray destSource{}, lhsSource{}, rhsSource{}, result{};
+            zttSnapshotMOperand(
+                xc, destBase, destSpan, zttDestReg, destSource);
+            zttSnapshotMOperand(xc, lhsBase, lhsSpan, zttLhsReg, lhsSource);
+            zttSnapshotMOperand(xc, rhsBase, rhsSpan, zttRhsReg, rhsSource);
+            for (uint32_t i = 0; i < destSpan; ++i)
+                result[i].zero();
+            const uint64_t physicalBits = zttPhysicalMRegBits(xc, len);
+            for (uint32_t square = 0; square < squareCount; ++square) {
+                auto destSquare = zttExtractMOperandSquare(
+                    destSource, physicalBits, destType, len, square);
+                const auto lhsSquare = zttExtractMOperandSquare(
+                    lhsSource, physicalBits, lhsType, len, square);
+                const auto rhsSquare = zttExtractMOperandSquare(
+                    rhsSource, physicalBits, rhsType, len, square);
+                if (ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddCol ||
+                    ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddRow ||
+                    ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxCol ||
+                    ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxRow) {
+                    const bool column = ZttElemwiseOp::%s ==
+                        ZttElemwiseOp::ScatterAddCol || ZttElemwiseOp::%s ==
+                        ZttElemwiseOp::ScatterMaxCol;
+                    zttExecuteScatter(
+                        xc, zttFpEnv, destSquare, lhsSquare, rhsSquare,
+                        destType,
+                        lhsType, rhsType, len, ZttElemwiseOp::%s, column);
+                } else if (zttElemwiseIsPermutation(
+                               ZttElemwiseOp::%s)) {
+                    zttExecutePermutation(
+                        xc, destSquare, lhsSquare, rhsSquare, destType,
+                        lhsType, rhsType, len, ZttElemwiseOp::%s);
+                } else {
+                    zttExecuteElementwise(
+                        xc, zttFpEnv, destSquare, lhsSquare, rhsSquare,
+                        destType,
+                        lhsType, rhsType, len, ZttElemwiseOp::%s, false, 0);
+                }
+                zttInsertMOperandSquare(
+                    result, physicalBits, destType, len, square,
+                    destSquare);
+            }
+            zttCommitMOperand(
+                xc, destBase, destSpan, result, zttDestReg);
+            ''' % tuple([op] * 21)
+        return setup
+}};
+
+def template ZttArithDeclare {{
+    class %(class_name)s : public %(base_class)s
+    {
+      private:
+        %(reg_idx_arr_decl)s;
+
+      public:
+        %(class_name)s(ExtMachInst machInst);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+        using %(base_class)s::generateDisassembly;
+    };
+}};
+
+def template ZttArithConstructor {{
+    %(class_name)s::%(class_name)s(ExtMachInst machInst)
+        : %(base_class)s("%(mnemonic)s", machInst, %(op_class)s)
+    {
+        %(set_reg_idx_arr)s;
+        %(constructor)s;
+    }
+}};
+
+def template ZttArithDecode {{
+    return new %(class_name)s(machInst);
+}};
+
+def template ZttArithExecute {{
+    Fault
+    %(class_name)s::execute(ExecContext *xc,
+        trace::InstRecord *traceData) const
+    {
+        Fault zttAccessFault = checkAccess(xc);
+        if (zttAccessFault != NoFault)
+            return zttAccessFault;
+        %(op_decl)s;
+        /* %(operands)s */
+        %(op_rd)s;
+        ZttFpEnv zttFpEnv;
+        %(ztt_aliases)s
+        %(code)s;
+        %(op_wb)s;
+        zttFpEnv.commit(xc);
+        markDirty(xc);
+        return NoFault;
+    }
+}};
+
+def format ZttArith2DOp(accumulate, negate, transpose_lhs, transpose_rhs,
+                        *flags) {{
+    code = zttMatrixMulBehaviour(accumulate, negate, transpose_lhs,
+                                  transpose_rhs)
+    # A 2-D operation always references the datatype registers selected by
+    # its encoded matrix and accumulator selectors.  The datatype banks are
+    # independent physical registers, so the source dependencies prevent any
+    # arithmetic operation from observing a stale msettyp/asettyp result.
+    operand_code = ('ZttAdReg = zttAccReg; '
+                    'ZttMs1Reg; ZttMs2Reg; '
+                    'ZttAdData; ZttMs1Data; ZttMs2Data;')
+    if accumulate:
+        operand_code += ' ZttAdReg;'
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code, 'operands': operand_code},
+                        zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttAccReg = ZttAdReg;
+        const auto &zttLhsReg = ZttMs1Reg;
+        const auto &zttRhsReg = ZttMs2Reg;
+        const uint32_t zttAcc = RiscvISA::ZttAccRegBase + ZTT_AD;
+        const uint32_t zttLhs =
+            RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const uint32_t zttRhs =
+            RiscvISA::ZttMatRegBase + ZTT_MS2;
+        const RegVal zttAccType = ZttAdData;
+        const RegVal zttLhsType = ZttMs1Data;
+        const RegVal zttRhsType = ZttMs2Data;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithElemwiseOp(code, *flags) {{
+    # Keep datatype dependencies coupled to every md/ms element-wise format.
+    # New element-wise descriptions only provide their arithmetic behaviour;
+    # this format supplies the structural and datatype-register plumbing.
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands': zttElementwiseOperands()},
+                        zttArithFlags(flags))
+    iop.ztt_aliases = zttElementwiseAliases()
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithBinaryOp(op, *flags) {{
+    code = zttElemwiseBehaviour(op)
+    read_dest = op in ('CmovGe', 'CmovLt', 'LdexpAcc', 'MulAcc',
+                       'MulAccNeg', 'MulAdd', 'MulSub', 'RdexpAcc',
+                       'ScatterAddCol', 'ScatterAddRow', 'ScatterMaxCol',
+                       'ScatterMaxRow')
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands': zttElementwiseOperands(read_dest)},
+                        zttArithFlags(flags))
+    iop.ztt_aliases = zttElementwiseAliases()
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithElemwiseScalarOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; '
+                         'ZttXs1; ZttMs2Reg; ZttMs2Data;'},
+                        zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttMatrixReg = ZttMs2Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttMatrix = RiscvISA::ZttMatRegBase + ZTT_MS2;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttMatrixType = ZttMs2Data;
+        const RegVal zttScalar = ZttXs1;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithScalarOp(op, *flags) {{
+    code = zttElemwiseBehaviour(op, scalar=True)
+    read_dest = op in ('LdexpAcc', 'MulAcc', 'MulAccNeg', 'MulAdd',
+                       'MulSub')
+    operands = ('ZttMdReg = zttDestReg; ZttMdData; '
+                'ZttXs1; ZttMs2Reg; ZttMs2Data;')
+    if read_dest:
+        operands += ' ZttMdReg;'
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code, 'operands': operands},
+                        zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttMatrixReg = ZttMs2Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttMatrix = RiscvISA::ZttMatRegBase + ZTT_MS2;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttMatrixType = ZttMs2Data;
+        const RegVal zttScalar = ZttXs1;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithControlScalarOp(op, exponent, *flags) {{
+    code = '''
+        ZttTypeInfo destType, srcType;
+        uint32_t len;
+        if (!zttGetDatatype(xc, zttDest, false, zttDestType, destType) ||
+            !zttGetDatatype(xc, zttMatrix, false, zttMatrixType, srcType) ||
+            !zttTileLen(xc, destType, len) ||
+            !zttTileLen(xc, srcType, len))
+            return NoFault;
+        constexpr bool zttExponentControl = %s;
+        constexpr bool zttArithmeticShift = %s;
+        if ((zttExponentControl &&
+             (destType.isFloating != srcType.isFloating)) ||
+            (!zttExponentControl &&
+             (destType.isFloating || srcType.isFloating ||
+              (zttArithmeticShift && !srcType.isSigned)))) {
+            zttSetUnsupported(xc);
+            return NoFault;
+        }
+        if ((destType.isFloating && !zttIsSupportedFloatType(destType)) ||
+            (srcType.isFloating && !zttIsSupportedFloatType(srcType))) {
+            zttSetUnsupported(xc);
+            return NoFault;
+        }
+        if (zttExponentControl) {
+            auto *isa = static_cast<RiscvISA::ISA *>(
+                xc->tcBase()->getIsaPtr());
+            ZttTypeInfo exponentType;
+            if (!zttDecodeType(xc, isa->ameMaxIntDtype(), exponentType) ||
+                exponentType.isFloating) {
+                zttSetUnsupported(xc);
+                return NoFault;
+            }
+        }
+        uint32_t destPack, srcPack, destGroup, srcGroup;
+        if (!zttPackFactor(xc, destType, destPack) ||
+            !zttPackFactor(xc, srcType, srcPack) ||
+            !zttGroupSize(xc, destType, destGroup) ||
+            !zttGroupSize(xc, srcType, srcGroup))
+            return NoFault;
+        const uint32_t squareCount = std::max(destPack, srcPack);
+        const uint32_t destBase =
+            zttDest - RiscvISA::ZttMatRegBase;
+        const uint32_t srcBase =
+            zttMatrix - RiscvISA::ZttMatRegBase;
+        uint32_t destSpan, srcSpan;
+        if (!zttMSpan(destBase, squareCount, destPack, destGroup,
+                      destSpan) ||
+            !zttMSpan(srcBase, squareCount, srcPack, srcGroup, srcSpan))
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME control-scalar register span", machInst);
+        ZttMRegArray destSource{}, srcSource{}, result{};
+        zttSnapshotMOperand(
+            xc, destBase, destSpan, zttDestReg, destSource);
+        zttSnapshotMOperand(
+            xc, srcBase, srcSpan, zttMatrixReg, srcSource);
+        for (uint32_t i = 0; i < destSpan; ++i)
+            result[i].zero();
+        const uint64_t physicalBits = zttPhysicalMRegBits(xc, len);
+        for (uint32_t square = 0; square < squareCount; ++square) {
+            auto destSquare = zttExtractMOperandSquare(
+                destSource, physicalBits, destType, len, square);
+            const auto srcSquare = zttExtractMOperandSquare(
+                srcSource, physicalBits, srcType, len, square);
+            zttExecuteElementwise(
+                xc, zttFpEnv, destSquare, srcSquare, srcSquare, destType,
+                srcType, srcType, len, ZttElemwiseOp::%s, true, zttScalar,
+                %s);
+            zttInsertMOperandSquare(
+                result, physicalBits, destType, len, square, destSquare);
+        }
+        zttCommitMOperand(xc, destBase, destSpan, result, zttDestReg);
+    ''' % ('true' if exponent else 'false',
+           'true' if op == 'ShiftRightArithmetic' else 'false', op,
+           'true' if exponent else 'false')
+    operands = ('ZttMdReg = zttDestReg; ZttMdData; '
+                'ZttXs1; ZttMs2Reg; ZttMs2Data;')
+    if exponent and op == 'LdexpAcc':
+        operands += ' ZttMdReg;'
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code, 'operands': operands},
+                        zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttMatrixReg = ZttMs2Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttMatrix = RiscvISA::ZttMatRegBase + ZTT_MS2;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttMatrixType = ZttMs2Data;
+        const RegVal zttScalar = ZttXs1;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttAxisScalarOp(column, broadcast, *flags) {{
+    code = '''
+        ZttTypeInfo destType, srcType;
+        uint32_t len;
+        if (!zttGetDatatype(xc, zttDest, false, zttDestType, destType) ||
+            !zttGetDatatype(xc, zttSrc, false, zttSrcType, srcType) ||
+            !zttTileLen(xc, destType, len) ||
+            !zttTileLen(xc, srcType, len))
+            return NoFault;
+        if (zttDestType != zttSrcType) {
+            zttSetUnsupported(xc);
+            return NoFault;
+        }
+        uint32_t destPack, srcPack, destGroup, srcGroup;
+        if (!zttPackFactor(xc, destType, destPack) ||
+            !zttPackFactor(xc, srcType, srcPack) ||
+            !zttGroupSize(xc, destType, destGroup) ||
+            !zttGroupSize(xc, srcType, srcGroup))
+            return NoFault;
+        if (destPack != 1 || srcPack != 1) {
+            zttSetUnsupported(xc);
+            return NoFault;
+        }
+        const uint32_t destBase =
+            zttDest - RiscvISA::ZttMatRegBase;
+        const uint32_t srcBase = zttSrc - RiscvISA::ZttMatRegBase;
+        uint32_t destSpan, srcSpan;
+        if (!zttMSpan(destBase, 1, destPack, destGroup, destSpan) ||
+            !zttMSpan(srcBase, 1, srcPack, srcGroup, srcSpan))
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME axis register span", machInst);
+        ZttMRegArray srcRegs{}, result{};
+        zttSnapshotMOperand(xc, srcBase, srcSpan, zttSrcReg, srcRegs);
+        for (uint32_t i = 0; i < destSpan; ++i)
+            result[i].zero();
+        const uint64_t physicalBits = zttPhysicalMRegBits(xc, len);
+        const auto source = zttExtractMOperandSquare(
+            srcRegs, physicalBits, srcType, len, 0);
+        RiscvISA::MatRegContainer destSquare;
+        destSquare.zero();
+        if (%s) {
+            const uint32_t index = static_cast<uint32_t>(zttScalar);
+            if (index >= len)
+                return std::make_shared<IllegalInstFault>(
+                    "AME broadcast index out of range", machInst);
+            for (uint32_t row = 0; row < len; ++row)
+                for (uint32_t col = 0; col < len; ++col) {
+                    const uint32_t srcRow = %s ? row : index;
+                    const uint32_t srcCol = %s ? index : col;
+                    zttWriteTileElement(destSquare, destType, len, row, col,
+                        zttReadTileElement(source, srcType, len,
+                                           srcRow, srcCol));
+                }
+        } else {
+            const uint32_t shiftBits = static_cast<uint32_t>(zttScalar);
+            const int64_t shift = static_cast<int32_t>(shiftBits);
+            for (uint32_t row = 0; row < len; ++row)
+                for (uint32_t col = 0; col < len; ++col) {
+                    const int64_t srcRow = %s ? int64_t(row) :
+                        int64_t(row) + shift;
+                    const int64_t srcCol = %s ? int64_t(col) + shift :
+                        int64_t(col);
+                    if (srcRow >= 0 && srcRow < int64_t(len) &&
+                        srcCol >= 0 && srcCol < int64_t(len))
+                        zttWriteTileElement(destSquare, destType, len,
+                            row, col, zttReadTileElement(source, srcType, len,
+                                srcRow, srcCol));
+                }
+        }
+        zttInsertMOperandSquare(
+            result, physicalBits, destType, len, 0, destSquare);
+        zttCommitMOperand(xc, destBase, destSpan, result, zttDestReg);
+    ''' % tuple('true' if value else 'false' for value in
+                (broadcast, column, column, column, column))
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; ZttXs1; '
+                         'ZttMs2Reg; ZttMs2Data;'},
+                        zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttSrcReg = ZttMs2Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttSrc = RiscvISA::ZttMatRegBase + ZTT_MS2;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMs2Data;
+        const RegVal zttScalar = ZttXs1;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithUnaryOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; '
+                         'ZttMs1Reg; ZttMs1Data;'}, zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttSrcReg = ZttMs1Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttSrc = RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMs1Data;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithUnaryNamedOp(op, *flags) {{
+    code = zttElemwiseBehaviour(op, unary=True)
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; '
+                         'ZttMs1Reg; ZttMs1Data;'}, zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttSrcReg = ZttMs1Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttSrc = RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMs1Data;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttBroadcastOp(op, *flags) {{
+    code = '''
+        ZttTypeInfo destType;
+        uint32_t len;
+        if (!zttGetDatatype(xc, zttDest, false, zttDestType, destType) ||
+            !zttTileLen(xc, destType, len))
+            return NoFault;
+        zttExecuteElementwise(
+            xc, zttFpEnv, zttDestReg, zttDestReg, zttDestReg, destType,
+            destType, destType, len, ZttElemwiseOp::%s, true, zttScalar,
+            true);
+    ''' % op
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; ZttXs1;'},
+                        zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttScalar = ZttXs1;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttTypedBroadcastOp(*flags) {{
+    code = '''
+        ZttTypeInfo destType, sourceType;
+        uint32_t len, squares, groupSize, destSpan;
+        if (!zttGetDatatype(xc, zttDest, false, zttDestType, destType) ||
+            !zttDecodeType(xc, zttSourceType, sourceType) ||
+            !zttTileLen(xc, destType, len) ||
+            !zttPackFactor(xc, destType, squares) ||
+            !zttGroupSize(xc, destType, groupSize))
+            return NoFault;
+        if ((destType.isFloating && !zttIsSupportedFloatType(destType)) ||
+            (sourceType.isFloating && !zttIsSupportedFloatType(sourceType))) {
+            zttSetUnsupported(xc);
+            return NoFault;
+        }
+        const uint32_t destBase =
+            zttDest - RiscvISA::ZttMatRegBase;
+        if (!zttMSpan(destBase, squares, squares, groupSize, destSpan))
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME broadcast register span", machInst);
+        const unsigned __int128 raw =
+            static_cast<unsigned __int128>(zttScalar) &
+            zttBitMask128(sourceType.bits);
+        const auto converted =
+            zttConvertElement(raw, sourceType, destType, xc, zttFpEnv);
+        ZttMRegArray result{};
+        for (uint32_t i = 0; i < destSpan; ++i)
+            result[i].zero();
+        const uint64_t physicalBits = zttPhysicalMRegBits(xc, len);
+        for (uint32_t square = 0; square < squares; ++square) {
+            RiscvISA::MatRegContainer destSquare;
+            destSquare.zero();
+            for (uint32_t row = 0; row < len; ++row)
+                for (uint32_t col = 0; col < len; ++col)
+                    zttWriteTileElement(destSquare, destType, len, row,
+                                        col, converted);
+            zttInsertMOperandSquare(
+                result, physicalBits, destType, len, square, destSquare);
+        }
+        zttCommitMOperand(xc, destBase, destSpan, result, zttDestReg);
+    '''
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; '
+                         'ZttXs1; ZttXs2;'}, zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttScalar = ZttXs1;
+        const RegVal zttSourceType = ZttXs2 & 0xffffffffULL;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithReduceOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; '
+                         'ZttMs1Reg; ZttMs1Data;'}, zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttSrcReg = ZttMs1Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttSrc = RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMs1Data;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithShiftOp(*flags) {{
+    code = '''
+        ZttTypeInfo destType, srcType;
+        uint32_t len;
+        if (!zttGetDatatype(xc, zttDest, false, zttDestType, destType) ||
+            !zttGetDatatype(xc, zttSrc, false, zttSrcType, srcType) ||
+            !zttTileLen(xc, destType, len) ||
+            !zttTileLen(xc, srcType, len))
+            return NoFault;
+        zttExecuteShift(zttDestReg, zttSrcReg, destType, srcType, len,
+                        ZTT_SHIFT_IMM);
+    '''
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; '
+                         'ZttMs1Reg; ZttMs1Data;'}, zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttSrcReg = ZttMs1Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttSrc = RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMs1Data;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithRowZipOp(*flags) {{
+    code = '''
+        ZttTypeInfo destType, lhsType, rhsType;
+        uint32_t len;
+        if ((ZTT_MD & 1) || ZTT_MD + 1 >= RiscvISA::NumZttMatRegs ||
+            !zttGetDatatype(xc, zttDest, false, zttDestType, destType) ||
+            !zttGetDatatype(xc, zttLhs, false, zttLhsType, lhsType) ||
+            !zttGetDatatype(xc, zttRhs, false, zttRhsType, rhsType) ||
+            !zttTileLen(xc, destType, len) ||
+            !zttTileLen(xc, lhsType, len) ||
+            !zttTileLen(xc, rhsType, len))
+            return NoFault;
+        zttExecuteRowZip(zttDestReg, zttDestNextReg, zttLhsReg,
+                         zttRhsReg, destType, lhsType, rhsType, len);
+    '''
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; '
+                         'ZttMdNextReg = zttDestNextReg; ZttMdData; '
+                         'ZttMs1Reg; ZttMs1Data; '
+                         'ZttMs2Reg; ZttMs2Data;'}, zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        auto &zttDestNextReg = ZttMdNextReg;
+        const auto &zttLhsReg = ZttMs1Reg;
+        const auto &zttRhsReg = ZttMs2Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttLhs = RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const uint32_t zttRhs = RiscvISA::ZttMatRegBase + ZTT_MS2;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttLhsType = ZttMs1Data;
+        const RegVal zttRhsType = ZttMs2Data;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithRowUnzipOp(*flags) {{
+    code = '''
+        ZttTypeInfo destType, srcType;
+        uint32_t len;
+        if ((ZTT_MD & 1) || ZTT_MD + 1 >= RiscvISA::NumZttMatRegs ||
+            ZTT_MS1 + 1 >= RiscvISA::NumZttMatRegs ||
+            !zttGetDatatype(xc, zttDest, false, zttDestType, destType) ||
+            !zttGetDatatype(xc, zttSrc, false, zttSrcType, srcType) ||
+            !zttTileLen(xc, destType, len) ||
+            !zttTileLen(xc, srcType, len))
+            return NoFault;
+        zttExecuteRowUnzip(zttDestReg, zttDestNextReg, zttSrcReg,
+                           zttSrcNextReg, destType, srcType, len);
+    '''
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; '
+                         'ZttMdNextReg = zttDestNextReg; ZttMdData; '
+                         'ZttMs1Reg; ZttMs1NextReg; ZttMs1Data;'},
+                        zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        auto &zttDestNextReg = ZttMdNextReg;
+        const auto &zttSrcReg = ZttMs1Reg;
+        const auto &zttSrcNextReg = ZttMs1NextReg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttSrc = RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMs1Data;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttInPlaceZipOp(column, unzip, *flags) {{
+    code = '''
+        if (ZTT_MS1 == ZTT_MS2)
+            return std::make_shared<IllegalInstFault>(
+                "AME zip operands must be distinct", machInst);
+        ZttTypeInfo firstType, secondType;
+        uint32_t len;
+        if (!zttGetDatatype(xc, zttFirst, false, zttFirstType,
+                            firstType) ||
+            !zttGetDatatype(xc, zttSecond, false, zttSecondType,
+                            secondType) ||
+            !zttTileLen(xc, firstType, len) ||
+            !zttTileLen(xc, secondType, len))
+            return NoFault;
+        uint32_t packFactor, groupSize;
+        if (zttFirstType != zttSecondType ||
+            !zttPackFactor(xc, firstType, packFactor) ||
+            !zttGroupSize(xc, firstType, groupSize) || packFactor != 1) {
+            zttSetUnsupported(xc);
+            return NoFault;
+        }
+        const uint32_t firstBase =
+            zttFirst - RiscvISA::ZttMatRegBase;
+        const uint32_t secondBase =
+            zttSecond - RiscvISA::ZttMatRegBase;
+        uint32_t firstSpan, secondSpan;
+        if (!zttMSpan(firstBase, 1, 1, groupSize, firstSpan) ||
+            !zttMSpan(secondBase, 1, 1, groupSize, secondSpan))
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME zip register span", machInst);
+        ZttMRegArray firstSource{}, secondSource{};
+        ZttMRegArray firstResult{}, secondResult{};
+        zttSnapshotMOperand(
+            xc, firstBase, firstSpan, zttFirstReg, firstSource);
+        zttSnapshotMOperand(
+            xc, secondBase, secondSpan, zttSecondReg, secondSource);
+        for (uint32_t i = 0; i < firstSpan; ++i)
+            firstResult[i].zero();
+        for (uint32_t i = 0; i < secondSpan; ++i)
+            secondResult[i].zero();
+        const uint64_t physicalBits = zttPhysicalMRegBits(xc, len);
+        const auto a = zttExtractMOperandSquare(
+            firstSource, physicalBits, firstType, len, 0);
+        const auto b = zttExtractMOperandSquare(
+            secondSource, physicalBits, secondType, len, 0);
+        RiscvISA::MatRegContainer firstOutput, secondOutput;
+        firstOutput.zero();
+        secondOutput.zero();
+        for (uint32_t logical = 0; logical < 2 * len; ++logical)
+            for (uint32_t other = 0; other < len; ++other) {
+                uint32_t srcLogical;
+                bool fromSecond;
+                if (%s) {
+                    srcLogical = logical / 2;
+                    fromSecond = logical & 1;
+                } else {
+                    srcLogical = 2 * (logical %% len) + (logical >= len);
+                    fromSecond = srcLogical >= len;
+                    srcLogical %%= len;
+                }
+                const uint32_t srcRow = %s ? other : srcLogical;
+                const uint32_t srcCol = %s ? srcLogical : other;
+                const auto value = zttReadTileElement(
+                    fromSecond ? b : a, firstType, len, srcRow, srcCol);
+                zttWriteTileElement(
+                    logical < len ? firstOutput : secondOutput,
+                    firstType, len,
+                    %s ? other : logical %% len,
+                    %s ? logical %% len : other,
+                    value);
+            }
+        zttInsertMOperandSquare(
+            firstResult, physicalBits, firstType, len, 0, firstOutput);
+        zttInsertMOperandSquare(
+            secondResult, physicalBits, secondType, len, 0, secondOutput);
+        zttCommitMOperand(
+            xc, firstBase, firstSpan, firstResult, zttFirstReg);
+        zttCommitMOperand(
+            xc, secondBase, secondSpan, secondResult, zttSecondReg);
+    ''' % tuple('true' if value else 'false' for value in
+                (not unzip, column, column, column, column))
+    # The v0.6 encoding fixes rd=x0; ms1 and ms2 are both read/write.
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMs1Reg = zttFirstReg; '
+                         'ZttMs2Reg = zttSecondReg; '
+                         'ZttMs1Data; ZttMs2Data; '
+                         'ZttMs1Reg; ZttMs2Reg;'}, zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttFirstReg = ZttMs1Reg;
+        auto &zttSecondReg = ZttMs2Reg;
+        const uint32_t zttFirst = RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const uint32_t zttSecond = RiscvISA::ZttMatRegBase + ZTT_MS2;
+        const RegVal zttFirstType = ZttMs1Data;
+        const RegVal zttSecondType = ZttMs2Data;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};
+
+def format ZttArithZeroOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttArithStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttAdReg = zttAccReg; ZttAdData;'},
+                        zttArithFlags(flags))
+    iop.ztt_aliases = '''
+        auto &zttAccReg = ZttAdReg;
+        [[maybe_unused]] const uint32_t zttAcc =
+            RiscvISA::ZttAccRegBase + ZTT_AD;
+        [[maybe_unused]] const RegVal zttAccType = ZttAdData;
+    '''
+    header_output = ZttArithDeclare.subst(iop)
+    decoder_output = ZttArithConstructor.subst(iop)
+    decode_block = ZttArithDecode.subst(iop)
+    exec_output = ZttArithExecute.subst(iop)
+}};

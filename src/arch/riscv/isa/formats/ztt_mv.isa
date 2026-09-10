@@ -1,0 +1,483 @@
+// -*- mode:c++ -*-
+
+// Copyright (c) 2026 BOSC & ICT, CAS
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met: redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer;
+// redistributions in binary form must reproduce the above copyright
+// notice, this list of conditions and the following disclaimer in the
+// documentation and/or other materials provided with the distribution;
+// neither the name of the copyright holders nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+// Ztt v0.6 accumulator/tile move instructions.
+
+// ================== Ztt move instruction support ===========================
+output header {{
+class ZttMoveStaticInst : public ZttStaticInst
+{
+  protected:
+    ZttMoveStaticInst(const char *mnem, ExtMachInst machInst, OpClass opClass)
+        : ZttStaticInst(mnem, machInst, opClass)
+    {}
+};
+}};
+
+def template ZttMoveDeclare {{
+    class %(class_name)s : public %(base_class)s
+    {
+      private:
+        %(reg_idx_arr_decl)s;
+
+      public:
+        %(class_name)s(ExtMachInst machInst);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+        using %(base_class)s::generateDisassembly;
+    };
+}};
+
+def template ZttMoveConstructor {{
+    %(class_name)s::%(class_name)s(ExtMachInst machInst)
+        : %(base_class)s("%(mnemonic)s", machInst, %(op_class)s)
+    {
+        %(set_reg_idx_arr)s;
+        %(constructor)s;
+    }
+}};
+
+def template ZttMoveDecode {{
+    return new %(class_name)s(machInst);
+}};
+
+def template ZttMoveExecute {{
+    Fault
+    %(class_name)s::execute(ExecContext *xc,
+        trace::InstRecord *traceData) const
+    {
+        Fault zttAccessFault = checkAccess(xc);
+        if (zttAccessFault != NoFault)
+            return zttAccessFault;
+        %(op_decl)s;
+        /* %(operands)s */
+        %(op_rd)s;
+        ZttFpEnv zttFpEnv;
+        %(ztt_aliases)s
+        %(code)s;
+        %(op_wb)s;
+        zttFpEnv.commit(xc);
+        markDirty(xc);
+        return NoFault;
+    }
+}};
+
+def template ZttMoveReadExecute {{
+    Fault
+    %(class_name)s::execute(ExecContext *xc,
+        trace::InstRecord *traceData) const
+    {
+        Fault zttAccessFault = checkAccess(xc);
+        if (zttAccessFault != NoFault)
+            return zttAccessFault;
+        %(op_decl)s;
+        /* %(operands)s */
+        %(op_rd)s;
+        %(ztt_aliases)s
+        %(code)s;
+        %(op_wb)s;
+        return NoFault;
+    }
+}};
+
+def format ZttTileMoveOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                         {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; '
+                         'ZttMdData; '
+                         'ZttMsReg; ZttMsData;'},
+                        flags + ('IsSerializeBefore', 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttSrcReg = ZttMsReg;
+        [[maybe_unused]] const uint32_t zttDest =
+            RiscvISA::ZttMatRegBase + ZTT_MD;
+        [[maybe_unused]] const uint32_t zttSrc =
+            RiscvISA::ZttMatRegBase + ZTT_MS;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMsData;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveExecute.subst(iop)
+}};
+
+def format ZttAccToMatOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                         {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; '
+                         'ZttMdData; '
+                         'ZttAmovAsReg; ZttAmovData;'},
+                        flags + ('IsSerializeBefore', 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttSrcReg = ZttAmovAsReg;
+        [[maybe_unused]] const uint32_t zttDest =
+            RiscvISA::ZttMatRegBase + ZTT_MD;
+        [[maybe_unused]] const uint32_t zttSrc =
+            RiscvISA::ZttAccRegBase + ZTT_AMOV_AS;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttAmovData;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveExecute.subst(iop)
+}};
+
+def format ZttMatToAccOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                         {'code': code,
+                          'operands':
+                          'ZttAdReg = zttDestReg; ZttAdData; '
+                          'ZttMsReg; ZttMsData;'},
+                         flags + ('IsSerializeBefore', 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttAdReg;
+        const auto &zttSrcReg = ZttMsReg;
+        [[maybe_unused]] const uint32_t zttDest =
+            RiscvISA::ZttAccRegBase + ZTT_AD;
+        [[maybe_unused]] const uint32_t zttSrc =
+            RiscvISA::ZttMatRegBase + ZTT_MS;
+        const RegVal zttDestType = ZttAdData;
+        const RegVal zttSrcType = ZttMsData;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveExecute.subst(iop)
+}};
+
+def format ZttMatZeroOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                         {'code': code,
+                          'operands': 'ZttMdReg = zttDestReg; ZttMdData;'},
+                         flags + ('IsSerializeBefore', 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        [[maybe_unused]] const uint32_t zttDest =
+            RiscvISA::ZttMatRegBase + ZTT_MD;
+        [[maybe_unused]] const RegVal zttDestType = ZttMdData;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveExecute.subst(iop)
+}};
+
+def format ZttIndexOp(column, *flags) {{
+    code = '''
+        ZttTypeInfo type;
+        uint32_t len;
+        if (!zttGetDatatype(xc, zttDest, false, zttDestType, type) ||
+            !zttTileLen(xc, type, len))
+            return NoFault;
+        if (type.isFloating ||
+            (!type.isSigned && zttBitMask128(type.bits) < len - 1) ||
+            (type.isSigned && type.bits < 128 &&
+             ((static_cast<unsigned __int128>(1) << (type.bits - 1)) - 1) <
+                 len - 1)) {
+            zttSetUnsupported(xc);
+            return NoFault;
+        }
+        uint32_t squareCount, groupSize, destSpan;
+        if (!zttPackFactor(xc, type, squareCount) ||
+            !zttGroupSize(xc, type, groupSize))
+            return NoFault;
+        const uint32_t destBase =
+            zttDest - RiscvISA::ZttMatRegBase;
+        if (!zttMSpan(destBase, squareCount, squareCount, groupSize,
+                      destSpan))
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME index register span", machInst);
+        ZttMRegArray result{};
+        for (uint32_t i = 0; i < destSpan; ++i)
+            result[i].zero();
+        const uint64_t physicalBits = zttPhysicalMRegBits(xc, len);
+        for (uint32_t square = 0; square < squareCount; ++square) {
+            RiscvISA::MatRegContainer destSquare;
+            destSquare.zero();
+            for (uint32_t row = 0; row < len; ++row)
+                for (uint32_t col = 0; col < len; ++col)
+                    zttWriteTileElement(destSquare, type, len, row, col,
+                                        %s ? col : row);
+            zttInsertMOperandSquare(
+                result, physicalBits, type, len, square, destSquare);
+        }
+        zttCommitMOperand(xc, destBase, destSpan, result, zttDestReg);
+    ''' % ('true' if column else 'false')
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                         {'code': code,
+                          'operands': 'ZttMdReg = zttDestReg; ZttMdData;'},
+                         flags + ('IsSerializeBefore', 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const RegVal zttDestType = ZttMdData;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveExecute.subst(iop)
+}};
+
+def format ZttFixedMoveToMOp(width, *flags) {{
+    code = '''
+        constexpr uint32_t elemBits = %d;
+        auto *isa = static_cast<RiscvISA::ISA *>(
+            xc->tcBase()->getIsaPtr());
+        if (elemBits > 32 && isa->rvType() == RiscvISA::RV32)
+            return std::make_shared<IllegalInstFault>(
+                "64-bit AME move requires XLEN >= 64", machInst);
+        const RegVal configuredUnitBits = xc->readMiscReg(MISCREG_AMEUDSZ);
+        const RegVal configuredLen = xc->readMiscReg(MISCREG_AMENLEN);
+        if (configuredUnitBits > UINT32_MAX || configuredLen > UINT32_MAX)
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME fixed-width move configuration", machInst);
+        const uint32_t unitBits = configuredUnitBits;
+        const uint32_t len = configuredLen;
+        const uint64_t rowBits = uint64_t(len) * unitBits;
+        const uint64_t totalBits = uint64_t(len) * rowBits;
+        if (!len || len > RiscvISA::MatRegContainer::row ||
+            rowBits > RiscvISA::MaxMatRowLenInBits ||
+            totalBits > RiscvISA::MatRegContainer::size() * 8 ||
+            rowBits < elemBits || rowBits %% elemBits) {
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME fixed-width move configuration", machInst);
+        }
+        const uint64_t rowElements64 = rowBits / elemBits;
+        const uint64_t elementCount64 = uint64_t(len) * rowElements64;
+        if (!elementCount64 || elementCount64 > UINT32_MAX)
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME fixed-width move element count", machInst);
+        const uint32_t rowElements = rowElements64;
+        const uint32_t pos = static_cast<uint32_t>(
+            static_cast<uint64_t>(zttPosition) %% elementCount64);
+        auto bytes = zttDestReg.as<uint8_t>();
+        const uint32_t row = pos / rowElements;
+        const uint64_t baseBit = uint64_t(pos %% rowElements) * elemBits;
+        for (uint32_t bit = 0; bit < elemBits; ++bit) {
+            const uint64_t offset = baseBit + bit;
+            uint8_t &byte = bytes[row][offset / 8];
+            const uint8_t mask = uint8_t(1) << (offset & 7);
+            if ((static_cast<unsigned __int128>(zttScalar) >> bit) & 1)
+                byte |= mask;
+            else
+                byte &= ~mask;
+        }
+    ''' % width
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                         {'code': code,
+                          'operands':
+                          'ZttMdReg = zttDestReg; ZttXs1; ZttXs2; '
+                          'ZttMdReg;'}, flags)
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const RegVal zttScalar = ZttXs1;
+        const RegVal zttPosition = ZttXs2;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveExecute.subst(iop)
+}};
+
+def format ZttFixedMoveFromMOp(width, *flags) {{
+    code = '''
+        constexpr uint32_t elemBits = %d;
+        auto *isa = static_cast<RiscvISA::ISA *>(
+            xc->tcBase()->getIsaPtr());
+        if (elemBits > 32 && isa->rvType() == RiscvISA::RV32)
+            return std::make_shared<IllegalInstFault>(
+                "64-bit AME move requires XLEN >= 64", machInst);
+        const RegVal configuredUnitBits = xc->readMiscReg(MISCREG_AMEUDSZ);
+        const RegVal configuredLen = xc->readMiscReg(MISCREG_AMENLEN);
+        if (configuredUnitBits > UINT32_MAX || configuredLen > UINT32_MAX)
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME fixed-width move configuration", machInst);
+        const uint32_t unitBits = configuredUnitBits;
+        const uint32_t len = configuredLen;
+        const uint64_t rowBits = uint64_t(len) * unitBits;
+        const uint64_t totalBits = uint64_t(len) * rowBits;
+        if (!len || len > RiscvISA::MatRegContainer::row ||
+            rowBits > RiscvISA::MaxMatRowLenInBits ||
+            totalBits > RiscvISA::MatRegContainer::size() * 8 ||
+            rowBits < elemBits || rowBits %% elemBits) {
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME fixed-width move configuration", machInst);
+        }
+        const uint64_t rowElements64 = rowBits / elemBits;
+        const uint64_t elementCount64 = uint64_t(len) * rowElements64;
+        if (!elementCount64 || elementCount64 > UINT32_MAX)
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME fixed-width move element count", machInst);
+        const uint32_t rowElements = rowElements64;
+        const uint32_t pos = static_cast<uint32_t>(
+            static_cast<uint64_t>(zttPosition) %% elementCount64);
+        auto source = zttSrcReg;
+        auto bytes = source.as<uint8_t>();
+        const uint32_t row = pos / rowElements;
+        const uint64_t baseBit = uint64_t(pos %% rowElements) * elemBits;
+        RegVal result = 0;
+        for (uint32_t bit = 0; bit < elemBits; ++bit) {
+            const uint64_t offset = baseBit + bit;
+            const uint8_t byte = bytes[row][offset / 8];
+            result |= RegVal((byte >> (offset & 7)) & 1) << bit;
+        }
+        zttResult = result;
+    ''' % width
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                         {'code': code,
+                          'operands':
+                          'ZttXd = zttResult; ZttMs1Reg; ZttXs2;'}, flags)
+    iop.ztt_aliases = '''
+        RegVal &zttResult = ZttXd;
+        const auto &zttSrcReg = ZttMs1Reg;
+        const RegVal zttPosition = ZttXs2;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveReadExecute.subst(iop)
+}};
+
+def format ZttConvertOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                         {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; '
+                         'ZttMs1Reg; ZttMs1Data;'},
+                        flags + ('IsSerializeBefore', 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttSrcReg = ZttMs1Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttSrc = RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMs1Data;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveExecute.subst(iop)
+}};
+
+def format ZttPackOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                         {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; '
+                         'ZttMs1Reg; ZttMs1Data; '
+                         'ZttXs2; ZttMdReg;'},
+                        flags)
+    iop.ztt_aliases = '''
+        [[maybe_unused]] auto &zttDestReg = ZttMdReg;
+        [[maybe_unused]] const auto &zttSrcReg = ZttMs1Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttSrc = RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMs1Data;
+        const uint32_t zttSlot = ZttXs2;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveExecute.subst(iop)
+}};
+
+def format ZttPackV06Op(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                         {'code': code,
+                          'operands':
+                          'ZttMdReg = zttDestReg; ZttMdData; '
+                          'ZttMs2Reg; ZttMs2Data; ZttXs1; ZttMdReg;'},
+                         flags + ('IsSerializeBefore', 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const auto &zttSrcReg = ZttMs2Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttSrc = RiscvISA::ZttMatRegBase + ZTT_MS2;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMs2Data;
+        const uint32_t zttSlot = ZttXs1;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveExecute.subst(iop)
+}};
+
+def format ZttConvertNamedOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttMoveStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; '
+                         'ZttMdNextReg = zttDest1Reg; '
+                         'ZttMdNext2Reg = zttDest2Reg; '
+                         'ZttMdNext3Reg = zttDest3Reg; '
+                         'ZttMdNext4Reg = zttDest4Reg; '
+                         'ZttMdNext5Reg = zttDest5Reg; '
+                         'ZttMdNext6Reg = zttDest6Reg; '
+                         'ZttMdNext7Reg = zttDest7Reg; ZttMdData; '
+                         'ZttMs1Reg; ZttMs1NextReg; ZttMs1Next2Reg; '
+                         'ZttMs1Next3Reg; ZttMs1Next4Reg; '
+                         'ZttMs1Next5Reg; ZttMs1Next6Reg; '
+                         'ZttMs1Next7Reg; ZttMs1Data; '
+                         'ZttMdReg; ZttMdNextReg; ZttMdNext2Reg; '
+                         'ZttMdNext3Reg; ZttMdNext4Reg; '
+                         'ZttMdNext5Reg; ZttMdNext6Reg; '
+                         'ZttMdNext7Reg;'}, flags)
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        auto &zttDest1Reg = ZttMdNextReg;
+        auto &zttDest2Reg = ZttMdNext2Reg;
+        auto &zttDest3Reg = ZttMdNext3Reg;
+        auto &zttDest4Reg = ZttMdNext4Reg;
+        auto &zttDest5Reg = ZttMdNext5Reg;
+        auto &zttDest6Reg = ZttMdNext6Reg;
+        auto &zttDest7Reg = ZttMdNext7Reg;
+        const auto &zttSrcReg = ZttMs1Reg;
+        const auto &zttSrc1Reg = ZttMs1NextReg;
+        const auto &zttSrc2Reg = ZttMs1Next2Reg;
+        const auto &zttSrc3Reg = ZttMs1Next3Reg;
+        const auto &zttSrc4Reg = ZttMs1Next4Reg;
+        const auto &zttSrc5Reg = ZttMs1Next5Reg;
+        const auto &zttSrc6Reg = ZttMs1Next6Reg;
+        const auto &zttSrc7Reg = ZttMs1Next7Reg;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttSrc = RiscvISA::ZttMatRegBase + ZTT_MS1;
+        const RegVal zttDestType = ZttMdData;
+        const RegVal zttSrcType = ZttMs1Data;
+    '''
+    header_output = ZttMoveDeclare.subst(iop)
+    decoder_output = ZttMoveConstructor.subst(iop)
+    decode_block = ZttMoveDecode.subst(iop)
+    exec_output = ZttMoveExecute.subst(iop)
+}};

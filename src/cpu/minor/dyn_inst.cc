@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2013-2014, 2016,2018 ARM Limited
+ * Copyright (c) 2026 BOSC & ICT, CAS
  * All rights reserved
  *
  * The license below extends only to copyright in the software and shall
@@ -157,6 +158,9 @@ printRegName(std::ostream &os, const RegId& reg)
         break;
       case VecElemClass:
         os << reg;
+        break;
+      case MatRegClass:
+        os << 'a' << reg.index();
         break;
       case IntRegClass:
         os << 'r' << reg.index();

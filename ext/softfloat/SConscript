@@ -217,6 +217,10 @@ SoftfloatFile('ui32_to_f64.c')
 SoftfloatFile('ui64_to_f16.c')
 SoftfloatFile('ui64_to_f32.c')
 SoftfloatFile('ui64_to_f64.c')
+SoftfloatFile('bf16_convert_fp16.c')
+SoftfloatFile('bf16_to_f32.c')
+SoftfloatFile('f32_to_bf16.c')
+SoftfloatFile('s_roundPackToBF16.c')
 
 if use_fast_int64:
     SoftfloatFile('extF80_add.c')

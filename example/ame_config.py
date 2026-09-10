@@ -1,4 +1,5 @@
-# Copyright (c) 2026 The Regents of the University of California
+#
+# Copyright (c) 2026 BOSC & ICT, CAS
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -23,13 +24,23 @@
 # THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
 # (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+#
+
+"""AME RISC-V Full-System configuration for the standalone examples.
+
+The example suite intentionally exposes one guest CPU configuration: the
+timing ``RiscvMinorCPU``.  The guest remains a normal RISC-V bare-metal ELF;
+the report path is passed through gem5's native RISC-V semihosting interface.
+"""
 
 import argparse
+import shlex
 import sys
 
 import m5
 from m5.objects import (
     AddrRange,
+    BadAddr,
     Bridge,
     DDR3_1600_8x8,
     HiFive,
@@ -45,40 +56,60 @@ from m5.objects import (
     SystemXBar,
     VoltageDomain,
 )
-from m5.objects.RiscvCPU import RiscvAtomicSimpleCPU
-from m5.util.convert import toMemorySize
+from m5.objects.BaseMinorCPU import makeMinorDefaultFUPool
+from m5.objects.RiscvCPU import RiscvMinorCPU
 
-parser = argparse.ArgumentParser(
-    description="Run a RISC-V bare-metal unit-test binary."
-)
-parser.add_argument("binary", help="The bare-metal RISC-V binary to run.")
+
+parser = argparse.ArgumentParser()
 parser.add_argument(
-    "--mem-size",
-    default="128MiB",
-    help="Amount of memory to attach to the test system.",
+    "--cmd",
+    required=True,
+    help="bare-metal ELF and arguments",
 )
-
+parser.add_argument("--cpu", choices=("minor",), default="minor")
+parser.add_argument("--mem-size", default="128MiB")
+parser.add_argument(
+    "--matrix-op-lat",
+    type=int,
+    default=16,
+    help="Ztt MatrixUnit operation and issue latency in cycles",
+)
+parser.add_argument(
+    "--vector-op-lat",
+    type=int,
+    default=6,
+    help="non-memory RVV VectorUnit operation latency in cycles",
+)
 args = parser.parse_args()
+if args.matrix_op_lat < 1 or args.vector_op_lat < 1:
+    parser.error("Matrix and Vector latencies must be positive")
+command = shlex.split(args.cmd)
+if not command:
+    parser.error("--cmd must contain a bare-metal ELF")
 
 memory_start = 0x7FFFF000
 reset_vector_size = 0x1000
 
 system = RiscvSystem()
-system.mem_mode = "atomic"
+system.mem_mode = "timing"
 system.mem_ranges = [
     AddrRange(
         start=memory_start,
-        size=toMemorySize(args.mem_size) + reset_vector_size,
+        size=args.mem_size,
     )
 ]
-
 system.workload = RiscvBareMetal(
-    bootloader=args.binary,
-    semihosting=RiscvSemihosting(cmd_line=args.binary),
+    bootloader=command[0],
+    semihosting=RiscvSemihosting(
+        cmd_line=" ".join(command),
+        files_root_dir="/",
+    ),
 )
 
 system.iobus = IOXBar()
 system.membus = SystemXBar()
+system.membus.badaddr_responder = BadAddr(warn_access="warn")
+system.membus.default = system.membus.badaddr_responder.pio
 system.system_port = system.membus.cpu_side_ports
 
 system.platform = HiFive()
@@ -105,31 +136,36 @@ system.voltage_domain = VoltageDomain(voltage="1V")
 system.clk_domain = SrcClockDomain(
     clock="1GHz", voltage_domain=system.voltage_domain
 )
-system.cpu_voltage_domain = VoltageDomain()
 system.cpu_clk_domain = SrcClockDomain(
-    clock="1GHz", voltage_domain=system.cpu_voltage_domain
+    clock="1GHz", voltage_domain=VoltageDomain()
 )
 
-system.cpu = RiscvAtomicSimpleCPU(clk_domain=system.cpu_clk_domain, cpu_id=0)
+system.cpu = RiscvMinorCPU(
+    clk_domain=system.cpu_clk_domain,
+    cpu_id=0,
+    executeFuncUnits=makeMinorDefaultFUPool(
+        matrix_op_lat=args.matrix_op_lat,
+        vector_op_lat=args.vector_op_lat,
+    ),
+)
 system.cpu.icache_port = system.membus.cpu_side_ports
 system.cpu.dcache_port = system.membus.cpu_side_ports
 system.cpu.createInterruptController()
 system.cpu.createThreads()
 
-uncacheable_range = [
-    *system.platform._on_chip_ranges(),
-    *system.platform._off_chip_ranges(),
-]
-system.cpu.mmu.pma_checker = PMAChecker(uncacheable=uncacheable_range)
+system.cpu.mmu.pma_checker = PMAChecker(
+    uncacheable=[
+        *system.platform._on_chip_ranges(),
+        *system.platform._off_chip_ranges(),
+    ]
+)
 
 system.mem_ctrl = MemCtrl()
 system.mem_ctrl.dram = DDR3_1600_8x8(range=system.mem_ranges[0])
 system.mem_ctrl.port = system.membus.mem_side_ports
 
 root = Root(full_system=True, system=system)
-
 m5.instantiate()
-
 exit_event = m5.simulate()
-print(f"Exiting @ tick {m5.curTick()} because {exit_event.getCause()}.")
+print(f"gem5 exit: {exit_event.getCause()} at tick {m5.curTick()}")
 sys.exit(exit_event.getCode())

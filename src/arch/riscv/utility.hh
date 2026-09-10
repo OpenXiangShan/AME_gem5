@@ -15,6 +15,7 @@
  * modified or unmodified, in source code or in binary form.
  *
  * Copyright (c) 2016-2017 The University of Virginia
+ * Copyright (c) 2026 BOSC & ICT, CAS
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -51,6 +52,7 @@
 
 #include "arch/riscv/regs/float.hh"
 #include "arch/riscv/regs/int.hh"
+#include "arch/riscv/regs/matrix.hh"
 #include "arch/riscv/regs/vector.hh"
 #include "base/types.hh"
 #include "cpu/reg_class.hh"
@@ -159,6 +161,13 @@ registerName(RegId reg)
             return str.str();
         }
         return VecRegNames[reg.index()];
+    } else if (reg.is(MatRegClass)) {
+        if (reg.index() >= NumMatRegs) {
+            std::stringstream str;
+            str << "?? (m" << reg.index() << ')';
+            return str.str();
+        }
+        return MatRegNames[reg.index()];
     } else  {
         /* It must be an InvalidRegClass, in RISC-V we should treat it as a
          * zero register for the disassembler to work correctly.

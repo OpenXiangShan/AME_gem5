@@ -105,6 +105,20 @@ struct commonNaN { char _unused; };
 *----------------------------------------------------------------------------*/
 #define softfloat_isSigNaNF16UI( uiA ) ((((uiA) & 0x7E00) == 0x7C00) && ((uiA) & 0x01FF))
 
+#define defaultNaNBF16UI 0x7FC0
+#define softfloat_isSigNaNBF16UI( uiA ) ((((uiA) & 0x7FC0) == 0x7F80) && ((uiA) & 0x007F))
+#define softfloat_bf16UIToCommonNaN( uiA, zPtr ) \
+    do { \
+        if ( ! ((uiA) & 0x0040) ) softfloat_raiseFlags( softfloat_flag_invalid ); \
+        *(zPtr) = (struct commonNaN){ 0 }; \
+    } while (0)
+
+/*----------------------------------------------------------------------------
+| Converts the common NaN pointed to by `aPtr' into a bfloat16 NaN and
+| returns its bit pattern.
+*----------------------------------------------------------------------------*/
+#define softfloat_commonNaNToBF16UI( aPtr ) ((uint_fast16_t) defaultNaNBF16UI)
+
 /*----------------------------------------------------------------------------
 | Assuming `uiA' has the bit pattern of a 16-bit floating-point NaN, converts
 | this NaN to the common NaN form, and stores the resulting common NaN at the
@@ -457,4 +471,3 @@ void
 #endif
 
 #endif
-

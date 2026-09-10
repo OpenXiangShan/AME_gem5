@@ -4,6 +4,7 @@
  * Copyright (c) 2020 Barkhausen Institut
  * Copyright (c) 2022 Google LLC
  * Copyright (c) 2024 University of Rostock
+ * Copyright (c) 2026 BOSC & ICT, CAS
  * All rights reserved.
  *
  * Redistribution and use in source and binary forms, with or without
@@ -46,6 +47,7 @@
 #include "arch/riscv/pmp.hh"
 #include "arch/riscv/regs/float.hh"
 #include "arch/riscv/regs/int.hh"
+#include "arch/riscv/regs/matrix.hh"
 #include "arch/riscv/regs/misc.hh"
 #include "arch/riscv/regs/vector.hh"
 #include "arch/riscv/system.hh"
@@ -63,6 +65,7 @@
 #include "mem/packet.hh"
 #include "mem/request.hh"
 #include "params/RiscvISA.hh"
+#include "sim/full_system.hh"
 #include "sim/pseudo_inst.hh"
 
 namespace gem5
@@ -207,6 +210,14 @@ const std::array<const char *, NUM_MISCREGS> MiscRegNames = {{
     [MISCREG_VTYPE]         = "VTYPE",
     [MISCREG_VLENB]         = "VLENB",
 
+    [MISCREG_AMESTATUS]     = "AMESTATUS",
+    [MISCREG_AMENLEN]       = "AMENLEN",
+    [MISCREG_AMEUDSZ]       = "AMEUDSZ",
+    [MISCREG_AMESTYPE]      = "AMESTYPE",
+    [MISCREG_AMEOWN]        = "AMEOWN",
+    [MISCREG_AMEFFLAGS]     = "AMEFFLAGS",
+    [MISCREG_AMEXSAT]       = "AMEXSAT",
+
     // H-extension (RV64) registers
 
     [MISCREG_HVIP]          = "HVIP",
@@ -295,7 +306,6 @@ namespace
 RegClass vecElemClass(VecElemClass, VecElemClassName, 0, debug::IntRegs);
 RegClass vecPredRegClass(VecPredRegClass, VecPredRegClassName, 0,
         debug::IntRegs);
-RegClass matRegClass(MatRegClass, MatRegClassName, 0, debug::MatRegs);
 RegClass ccRegClass(CCRegClass, CCRegClassName, 0, debug::IntRegs);
 
 } // anonymous namespace
@@ -307,14 +317,26 @@ ISA::ISA(const Params &p)
       elen(p.elen),
       _privilegeModeSet(p.privilege_mode_set),
       _reportedExtensions(p.reported_extensions),
-      _wfiResumeOnPending(p.wfi_resume_on_pending)
+      _wfiResumeOnPending(p.wfi_resume_on_pending),
+      _ameBackendState(p.ame_backend_state),
+      _ameMaxIntDtype(p.ame_max_int_dtype)
 {
+    fatal_if(_ameBackendState != "available" &&
+             _ameBackendState != "busy" &&
+             _ameBackendState != "unsupported" &&
+             _ameBackendState != "disabled" &&
+             _ameBackendState != "interrupted" &&
+             _ameBackendState != "denied" &&
+             _ameBackendState != "impl_success" &&
+             _ameBackendState != "impl_failure",
+             "Unknown AME backend state '%s'", _ameBackendState.c_str());
+
     _regClasses.push_back(&intRegClass);
     _regClasses.push_back(&floatRegClass);
     _regClasses.push_back(&vecRegClass);
     _regClasses.push_back(&vecElemClass);
     _regClasses.push_back(&vecPredRegClass);
-    _regClasses.push_back(&matRegClass);
+    _regClasses.push_back(&RiscvISA::matRegClass);
     _regClasses.push_back(&ccRegClass);
     _regClasses.push_back(&miscRegClass);
 
@@ -381,6 +403,12 @@ ISA::copyRegsFrom(ThreadContext *src)
         tc->setReg(id, &vc);
     }
 
+    RiscvISA::MatRegContainer mc;
+    for (auto &id: RiscvISA::matRegClass) {
+        src->getReg(id, &mc);
+        tc->setReg(id, &mc);
+    }
+
     // Copying Misc Regs
     for (int i = 0; i < NUM_PHYS_MISCREGS; i++)
         tc->setMiscRegNoEffect(i, src->readMiscRegNoEffect(i));
@@ -432,6 +460,11 @@ void ISA::clear()
 
     // mark FS is initial
     status.fs = FPUStatus::INITIAL;
+    // Syscall-emulation guests run in U-mode and cannot enable mstatus.MS.
+    // Treat AME state like the initialized FPU/vector state in SE only;
+    // full-system software must still enable MS explicitly.
+    if (!FullSystem)
+        status.ms = AMEStatus::INITIAL;
 
     // _rvType dependent init.
     switch (_rvType) {
@@ -473,6 +506,14 @@ void ISA::clear()
     // triggers, starting at zero. simply set a different value here.
     miscRegFile[MISCREG_TSELECT] = 1;
     miscRegFile[MISCREG_NMIE] = reportsExtension("Smrnmi") ? 0 : 1;
+
+    miscRegFile[MISCREG_AMESTATUS] = 0;
+    miscRegFile[MISCREG_AMENLEN] = 4;
+    miscRegFile[MISCREG_AMEUDSZ] = 32;
+    miscRegFile[MISCREG_AMESTYPE] = 0;
+    miscRegFile[MISCREG_AMEOWN] = 0;
+    miscRegFile[MISCREG_AMEFFLAGS] = 0;
+    miscRegFile[MISCREG_AMEXSAT] = 0;
 }
 
 Fault
@@ -643,13 +684,15 @@ ISA::readMiscReg(RegIndex idx)
             // significant bit of the MSTATUS CSR for both RV32 and RV64.
             // . Per section 3.1.6.6, page 29, the explicit formula for
             // updating the SD is,
-            //   SD = ((FS==DIRTY) | (XS==DIRTY) | (VS==DIRTY))
+            //   SD = ((FS==DIRTY) | (XS==DIRTY) | (VS==DIRTY) |
+            //         (MS==DIRTY))
             // . Ideally, we want to update the SD after every relevant
             // instruction, however, lazily updating the Status register
             // upon its read produces the same effect as well.
             STATUS status = readMiscRegNoEffect(idx);
             uint64_t sd_bit = \
-                (status.xs == 3) || (status.fs == 3) || (status.vs == 3);
+                (status.xs == 3) || (status.fs == 3) ||
+                (status.vs == 3) || (status.ms == 3);
             // For RV32, the SD bit is at index 31
             // For RV64, the SD bit is at index 63.
             switch (_rvType) {
@@ -726,6 +769,17 @@ ISA::readMiscReg(RegIndex idx)
                     nstatus.mnpp = (misa.rvu) ? PRV_U : PRV_M;
             }
             return nstatus;
+        }
+
+      case MISCREG_AMESTATUS:
+      case MISCREG_AMENLEN:
+      case MISCREG_AMEUDSZ:
+      case MISCREG_AMESTYPE:
+      case MISCREG_AMEOWN:
+      case MISCREG_AMEFFLAGS:
+      case MISCREG_AMEXSAT:
+        {
+            return readMiscRegNoEffect(idx);
         }
 
       case MISCREG_FFLAGS_EXE:
@@ -1068,6 +1122,21 @@ ISA::setMiscReg(RegIndex idx, RegVal val)
                 setMiscRegNoEffect(MISCREG_VXRM, (val & 0x6) >> 1);
             }
             break;
+          case MISCREG_AMENLEN:
+          case MISCREG_AMEUDSZ:
+          case MISCREG_AMEOWN:
+            // Read-only AME capability and ownership CSRs.
+            break;
+          case MISCREG_AMESTYPE:
+            setMiscRegNoEffect(idx, val & mask(32));
+            break;
+          case MISCREG_AMEFFLAGS:
+            setMiscRegNoEffect(idx, val & 0x1f);
+            break;
+          case MISCREG_AMEXSAT:
+          case MISCREG_AMESTATUS:
+            setMiscRegNoEffect(idx, val & 0x1);
+            break;
           case MISCREG_PRV:
             {
                 setMiscRegNoEffect(idx, val);
@@ -1272,6 +1341,49 @@ ISA::tvmChecks(uint64_t csr, PrivilegeMode pm, ExtMachInst machInst)
     return NoFault;
 }
 
+Fault
+ISA::checkAMECSRAccess(
+    ExecContext *xc, uint64_t csr, bool write, ExtMachInst machInst)
+{
+    const bool ameCsr = csr == CSR_AMENLEN || csr == CSR_AMEUDSZ ||
+        csr == CSR_AMESTYPE || csr == CSR_AMEOWN ||
+        csr == CSR_AMEFFLAGS || csr == CSR_AMEXSAT ||
+        csr == CSR_AMESTATUS;
+    if (!ameCsr)
+        return NoFault;
+
+    Fault fault = checkAMEEnabled(xc, machInst, false);
+    if (fault != NoFault)
+        return fault;
+
+    const bool capabilityRead = !write &&
+        (csr == CSR_AMENLEN || csr == CSR_AMEUDSZ || csr == CSR_AMEOWN);
+    if (!capabilityRead &&
+        !(xc->readMiscReg(MISCREG_AMEOWN) & 1)) {
+        return std::make_shared<IllegalInstFault>(
+            "AME CSR access without backend ownership", machInst);
+    }
+    return NoFault;
+}
+
+Fault
+ISA::checkAMEStatusWrite(
+    ExecContext *xc, uint64_t csr, RegVal value, ExtMachInst machInst)
+{
+    if (!(xc->readMiscReg(MISCREG_AMEOWN) & 1))
+        return NoFault;
+
+    const bool virtualized = RiscvISA::virtualizationEnabled(xc);
+    const bool applicableStatus = csr == CSR_MSTATUS ||
+        (csr == CSR_SSTATUS && !virtualized) ||
+        (csr == CSR_VSSTATUS && virtualized);
+    if (applicableStatus && !(value & STATUS_MS_MASK)) {
+        return std::make_shared<IllegalInstFault>(
+            "cannot disable AME state while owning the backend", machInst);
+    }
+    return NoFault;
+}
+
 RegVal
 ISA::backdoorReadCSRAllBits(ExecContext *xc, uint64_t csr)
 {
@@ -1401,6 +1513,9 @@ ISA::writeCSR(ExecContext *xc, uint64_t csr, RegVal writeData)
         }
     }
 
+    if (csr == CSR_MSTATUS || csr == CSR_SSTATUS || csr == CSR_VSSTATUS)
+        write_mask |= STATUS_MS_MASK;
+
     auto writeDataMasked = writeData & write_mask;
 
     // CSRs are often aliases with different visibility
@@ -1437,6 +1552,13 @@ ISA::writeCSR(ExecContext *xc, uint64_t csr, RegVal writeData)
             xc->setMiscReg(midx, new_reg_data_all);
             break;
         }
+        case CSR_AMESTATUS:
+            // AME status bits are sticky: writing zero clears a bit and
+            // writing one preserves it.
+            xc->setMiscReg(
+                MISCREG_AMESTATUS,
+                xc->readMiscReg(MISCREG_AMESTATUS) & writeData & 1);
+            break;
         // case CSR_MIP: case CSR_MIE:
         // case CSR_HIP: case CSR_HIE:
         // case CSR_SIP: case CSR_SIE:
@@ -1548,6 +1670,76 @@ updateVPUStatus(
     }
 
     return NoFault;
+}
+
+RegVal
+ISA::ameAcquireResult(uint32_t wait_mode, uint32_t timeout_class) const
+{
+    // The base model is deterministic and configurable.  A future shared
+    // backend can override this hook with live ownership, policy, timeout,
+    // and interrupt state while preserving the instruction-side protocol.
+    (void)timeout_class;
+    if (_ameBackendState == "available")
+        return encodeAMEAcquireStatus(AMEAcquireStatus::GRANTED);
+    if (_ameBackendState == "unsupported")
+        return encodeAMEAcquireStatus(AMEAcquireStatus::UNSUPPORTED);
+    if (_ameBackendState == "disabled")
+        return encodeAMEAcquireStatus(AMEAcquireStatus::DISABLED);
+    if (_ameBackendState == "denied")
+        return encodeAMEAcquireStatus(AMEAcquireStatus::DENIED);
+    if (_ameBackendState == "impl_success")
+        return encodeAMEAcquireStatus(AMEAcquireStatus::IMPL_DEFINED, true);
+    if (_ameBackendState == "impl_failure")
+        return encodeAMEAcquireStatus(AMEAcquireStatus::IMPL_DEFINED, false);
+
+    // TRY never waits.  BOUNDED_WAIT observes either an interruption or the
+    // expiry of its implementation-defined finite interval.
+    if (wait_mode == 0)
+        return encodeAMEAcquireStatus(AMEAcquireStatus::BUSY);
+    if (_ameBackendState == "interrupted")
+        return encodeAMEAcquireStatus(AMEAcquireStatus::INTERRUPTED);
+    return encodeAMEAcquireStatus(AMEAcquireStatus::TIMEOUT);
+}
+
+Fault
+checkAMEEnabled(ExecContext *xc, ExtMachInst machInst, bool require_owner)
+{
+    MISA misa = xc->readMiscReg(MISCREG_ISA);
+    STATUS status = xc->readMiscReg(MISCREG_STATUS);
+    if (status.ms == AMEStatus::OFF) {
+        return std::make_shared<IllegalInstFault>(
+            "AME is disabled in mstatus.MS", machInst);
+    }
+
+    if (misa.rvh && virtualizationEnabled(xc)) {
+        STATUS vsstatus = xc->readMiscReg(MISCREG_VSSTATUS);
+        if (vsstatus.ms == AMEStatus::OFF) {
+            return std::make_shared<IllegalInstFault>(
+                "AME is disabled in vsstatus.MS", machInst);
+        }
+    }
+
+    if (require_owner &&
+        !(xc->readMiscReg(MISCREG_AMEOWN) & 1)) {
+        return std::make_shared<IllegalInstFault>(
+            "AME backend is not owned by this context", machInst);
+    }
+    return NoFault;
+}
+
+void
+markAMEDirty(ExecContext *xc)
+{
+    MISA misa = xc->readMiscReg(MISCREG_ISA);
+    STATUS status = xc->readMiscReg(MISCREG_STATUS);
+    status.ms = AMEStatus::DIRTY;
+    xc->setMiscReg(MISCREG_STATUS, status);
+
+    if (misa.rvh && virtualizationEnabled(xc)) {
+        STATUS vsstatus = xc->readMiscReg(MISCREG_VSSTATUS);
+        vsstatus.ms = AMEStatus::DIRTY;
+        xc->setMiscReg(MISCREG_VSSTATUS, vsstatus);
+    }
 }
 
 

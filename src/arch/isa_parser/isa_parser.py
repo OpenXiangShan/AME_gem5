@@ -12,6 +12,7 @@
 #
 # Copyright (c) 2003-2005 The Regents of The University of Michigan
 # Copyright (c) 2013,2015 Advanced Micro Devices, Inc.
+# Copyright (c) 2026 BOSC & ICT, CAS
 # All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
@@ -577,6 +578,11 @@ class ISAParser(Grammar):
                 "VecRegOp": VecRegOperandDesc,
                 "VecPredRegOp": VecPredRegOperandDesc,
                 "MatRegOp": MatRegOperandDesc,
+                "ZttMatRegOp": ZttMatRegOperandDesc,
+                "ZttMatRegIndexOp": ZttMatRegIndexOperandDesc,
+                "ZttAccRegIndexOp": ZttAccRegIndexOperandDesc,
+                "ZttMatDataRegOp": ZttMatDataRegOperandDesc,
+                "ZttAccDataRegOp": ZttAccDataRegOperandDesc,
                 "ControlRegOp": ControlRegOperandDesc,
                 "MemOp": MemOperandDesc,
                 "PCStateOp": PCStateOperandDesc,

@@ -1,0 +1,783 @@
+// -*- mode:c++ -*-
+
+// Copyright (c) 2026 BOSC & ICT, CAS
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met: redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer;
+// redistributions in binary form must reproduce the above copyright
+// notice, this list of conditions and the following disclaimer in the
+// documentation and/or other materials provided with the distribution;
+// neither the name of the copyright holders nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+// Ztt v0.6 polymorphic tile loads and stores.
+
+// ================== Ztt memory instruction support ==========================
+output header {{
+class ZttMemStaticInst : public ZttStaticInst
+{
+  protected:
+    ZttMemStaticInst(const char *mnem, ExtMachInst machInst, OpClass opClass)
+        : ZttStaticInst(mnem, machInst, opClass)
+    {}
+};
+}};
+
+def template ZttMemDeclare {{
+    class %(class_name)s : public %(base_class)s
+    {
+      private:
+        %(reg_idx_arr_decl)s;
+
+      public:
+        %(class_name)s(ExtMachInst machInst);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+        Fault initiateAcc(ExecContext *, trace::InstRecord *) const override;
+        Fault completeAcc(PacketPtr, ExecContext *,
+                          trace::InstRecord *) const override;
+        using %(base_class)s::generateDisassembly;
+    };
+}};
+
+def template ZttMemConstructor {{
+    %(class_name)s::%(class_name)s(ExtMachInst machInst)
+        : %(base_class)s("%(mnemonic)s", machInst, %(op_class)s)
+    {
+        %(set_reg_idx_arr)s;
+        %(constructor)s;
+    }
+}};
+
+def template ZttMemDecode {{
+    return new %(class_name)s(machInst);
+}};
+
+def template ZttMemExecute {{
+    Fault
+    %(class_name)s::execute(ExecContext *xc,
+        trace::InstRecord *traceData) const
+    {
+        Fault zttAccessFault = checkAccess(xc);
+        if (zttAccessFault != NoFault)
+            return zttAccessFault;
+        %(op_decl)s;
+        /* %(operands)s */
+        %(op_rd)s;
+        %(ztt_aliases)s
+        %(code)s;
+        %(op_wb)s;
+        return NoFault;
+    }
+}};
+
+def template ZttMemInitiateAcc {{
+    Fault
+    %(class_name)s::initiateAcc(ExecContext *xc,
+        trace::InstRecord *traceData) const
+    {
+        Fault zttAccessFault = checkAccess(xc);
+        if (zttAccessFault != NoFault)
+            return zttAccessFault;
+        /* %(initiate_operands)s */
+        %(op_src_decl)s;
+        %(op_rd)s;
+        %(initiate_aliases)s
+        %(initiate_code)s;
+    }
+}};
+
+def template ZttMemCompleteAcc {{
+    Fault
+    %(class_name)s::completeAcc(PacketPtr pkt, ExecContext *xc,
+        trace::InstRecord *traceData) const
+    {
+        Fault zttAccessFault = checkAccess(xc);
+        if (zttAccessFault != NoFault)
+            return zttAccessFault;
+        /* %(complete_operands)s */
+        %(op_decl)s;
+        %(op_rd)s;
+        %(complete_aliases)s
+        %(complete_code)s;
+        %(op_wb)s;
+        return NoFault;
+    }
+}};
+
+let {{
+def zttLoadTileBehaviour(column_major, timing):
+    linear = 'c * len + r' if column_major else 'r * len + c'
+    memory = '''
+        if (!xc->readMemAccPredicate())
+            return NoFault;
+        const uint8_t *data = pkt->getConstPtr<uint8_t>();
+    ''' if timing else '''
+        std::array<uint8_t, RiscvISA::MatRegContainer::size()> buffer{};
+        const std::vector<bool> byteEnable(memSize, true);
+        Fault fault = xc->readMem(zttBase, buffer.data(), memSize, 0,
+                                  byteEnable);
+        if (fault != NoFault)
+            return fault;
+        const uint8_t *data = buffer.data();
+    '''
+    return '''
+        ZttTypeInfo type;
+        uint32_t len;
+        if (!zttGetDatatype(xc, zttDest, false, zttDestType, type) ||
+            !zttTileLen(xc, type, len))
+            return NoFault;
+        const uint32_t unitBits = static_cast<uint32_t>(
+            xc->readMiscReg(MISCREG_AMEUDSZ));
+        uint32_t squares, groupSize, regSpan;
+        if (!zttPackFactor(xc, type, squares) ||
+            !zttGroupSize(xc, type, groupSize))
+            return NoFault;
+        if (!zttMSpan(ZTT_MD, squares, squares, groupSize, regSpan))
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME load register span", machInst);
+        const uint32_t elementBytes = (type.bits + 7) / 8;
+        if (zttBase %% elementBytes)
+            return std::make_shared<AddressFault>(
+                zttBase, LOAD_ADDR_MISALIGNED);
+        const uint32_t transferBits = std::max(type.bits, unitBits);
+        const uint32_t memSize =
+            (uint64_t(len) * len * transferBits + 7) / 8;
+        (void)memSize;
+        %s
+        std::array<RiscvISA::MatRegContainer,
+                   RiscvISA::NumZttMatRegs> results{};
+        for (uint32_t i = 0; i < regSpan; ++i)
+            results[i].zero();
+        const uint64_t physicalBits = uint64_t(len) * len * unitBits;
+        for (uint32_t square = 0; square < squares; ++square) {
+            for (uint32_t r = 0; r < len; ++r) {
+                for (uint32_t c = 0; c < len; ++c) {
+                    const uint32_t linear = %s;
+                    const uint64_t sourceBit =
+                        (uint64_t(square) * len * len + linear) * type.bits;
+                    unsigned __int128 value = 0;
+                    for (uint32_t bit = 0; bit < type.bits; ++bit)
+                        value |= static_cast<unsigned __int128>(
+                            (data[(sourceBit + bit) / 8] >>
+                             ((sourceBit + bit) & 7)) & 1) << bit;
+                    const uint64_t element =
+                        (uint64_t(square) * len + r) * len + c;
+                    zttWriteMOperandElement(results, physicalBits, type,
+                                            element, value);
+                }
+            }
+        }
+        zttDestReg = results[0];
+        for (uint32_t i = 1; i < regSpan; ++i)
+            xc->tcBase()->setReg(
+                RiscvISA::matRegClass[
+                    RiscvISA::ZttMatRegBase + ZTT_MD + i],
+                &results[i]);
+        markDirty(xc);
+    ''' % (memory, linear)
+
+def zttLoadInitiateBehaviour():
+    return '''
+        ZttTypeInfo type;
+        uint32_t len;
+        if (!zttGetDatatype(xc, zttDest, false, zttDestType, type) ||
+            !zttTileLen(xc, type, len)) {
+            xc->setMemAccPredicate(false);
+            return NoFault;
+        }
+        const uint32_t unitBits = static_cast<uint32_t>(
+            xc->readMiscReg(MISCREG_AMEUDSZ));
+        uint32_t squares, groupSize, regSpan;
+        if (!zttPackFactor(xc, type, squares) ||
+            !zttGroupSize(xc, type, groupSize)) {
+            xc->setMemAccPredicate(false);
+            return NoFault;
+        }
+        if (!zttMSpan(ZTT_MD, squares, squares, groupSize, regSpan))
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME load register span", machInst);
+        const uint32_t elementBytes = (type.bits + 7) / 8;
+        if (zttBase % elementBytes)
+            return std::make_shared<AddressFault>(
+                zttBase, LOAD_ADDR_MISALIGNED);
+        (void)regSpan;
+        const uint32_t memSize =
+            (uint64_t(len) * len * std::max(type.bits, unitBits) + 7) / 8;
+        const std::vector<bool> byteEnable(memSize, true);
+        return initiateMemRead(xc, zttBase, memSize, 0, byteEnable);
+    '''
+
+def zttStoreTileBehaviour(column_major):
+    linear = 'c * len + r' if column_major else 'r * len + c'
+    return '''
+        ZttTypeInfo type;
+        uint32_t len;
+        if (!zttGetDatatype(xc, zttSrc, false, zttSrcType, type) ||
+            !zttTileLen(xc, type, len)) {
+            xc->setMemAccPredicate(false);
+            return NoFault;
+        }
+        const uint32_t unitBits = static_cast<uint32_t>(
+            xc->readMiscReg(MISCREG_AMEUDSZ));
+        uint32_t squares, groupSize, regSpan;
+        if (!zttPackFactor(xc, type, squares) ||
+            !zttGroupSize(xc, type, groupSize)) {
+            xc->setMemAccPredicate(false);
+            return NoFault;
+        }
+        if (!zttMSpan(ZTT_STORE_MS1, squares, squares, groupSize, regSpan))
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME store register span", machInst);
+        const uint32_t elementBytes = (type.bits + 7) / 8;
+        if (zttBase %% elementBytes)
+            return std::make_shared<AddressFault>(
+                zttBase, STORE_ADDR_MISALIGNED);
+        const uint32_t transferBits = std::max(type.bits, unitBits);
+        const uint32_t memSize =
+            (uint64_t(len) * len * transferBits + 7) / 8;
+        std::array<uint8_t, RiscvISA::MatRegContainer::size()> data{};
+        std::array<RiscvISA::MatRegContainer,
+                   RiscvISA::NumZttMatRegs> sources{};
+        sources[0] = zttSrcReg;
+        for (uint32_t i = 1; i < regSpan; ++i)
+            xc->tcBase()->getReg(
+                RiscvISA::matRegClass[
+                    RiscvISA::ZttMatRegBase + ZTT_STORE_MS1 + i],
+                &sources[i]);
+        const uint64_t physicalBits = uint64_t(len) * len * unitBits;
+        for (uint32_t square = 0; square < squares; ++square) {
+            for (uint32_t r = 0; r < len; ++r) {
+                for (uint32_t c = 0; c < len; ++c) {
+                    const uint32_t linear = %s;
+                    const uint64_t destBit =
+                        (uint64_t(square) * len * len + linear) * type.bits;
+                    const uint64_t element =
+                        (uint64_t(square) * len + r) * len + c;
+                    const auto value = zttReadMOperandElement(
+                        sources, physicalBits, type, element);
+                    for (uint32_t bit = 0; bit < type.bits; ++bit) {
+                        const uint8_t mask = uint8_t(1) <<
+                                             ((destBit + bit) & 7);
+                        if ((value >> bit) & 1)
+                            data[(destBit + bit) / 8] |= mask;
+                        else
+                            data[(destBit + bit) / 8] &= ~mask;
+                    }
+                }
+            }
+        }
+        const std::vector<bool> byteEnable(memSize, true);
+        return xc->writeMem(data.data(), memSize, zttBase, 0, nullptr,
+                            byteEnable);
+    ''' % linear
+
+def zttStridedGeometry(transposed):
+    return '''
+        constexpr bool zttTransposed = %s;
+        ZttTypeInfo type;
+        uint32_t len, squares, groupSize, regSpan;
+        if (!zttGetDatatype(xc, zttRegIndex, false, zttRegType, type) ||
+            !zttTileLen(xc, type, len) ||
+            !zttPackFactor(xc, type, squares) ||
+            !zttGroupSize(xc, type, groupSize) ||
+            !zttPackedTileFits(xc, type, len, squares))
+            return NoFault;
+        if (!zttMSpan(zttRegSelector, squares, squares, groupSize, regSpan))
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME strided register span", machInst);
+        const uint32_t elementBytes = (type.bits + 7) / 8;
+        if (zttBase %% elementBytes)
+            return std::make_shared<AddressFault>(
+                zttBase, zttIsLoad ? LOAD_ADDR_MISALIGNED :
+                                     STORE_ADDR_MISALIGNED);
+        const uint64_t segmentCount = zttTransposed ?
+            uint64_t(squares) * len : len;
+        const uint64_t segmentBits = zttTransposed ?
+            uint64_t(len) * type.bits :
+            uint64_t(squares) * len * type.bits;
+        const uint64_t segmentBytes = (segmentBits + 7) / 8;
+        const uint64_t offsetCount = segmentCount - 1;
+        // The product and address addition are architectural unsigned XLEN
+        // arithmetic.  Keep the unmasked product wide enough to determine
+        // whether the legacy aggregate timing request can represent it, but
+        // never reject an atomic transfer merely because the product wraps.
+        const unsigned __int128 fullLastOffset =
+            static_cast<unsigned __int128>(offsetCount) * zttStride;
+        // Segment addresses use unsigned XLEN-bit arithmetic.  In RV64,
+        // adding an offset to zttBase therefore intentionally wraps in Addr.
+        if (segmentBytes > std::numeric_limits<unsigned>::max()) {
+            return std::make_shared<AddressFault>(
+                zttBase, zttIsLoad ? LOAD_ACCESS : STORE_ACCESS);
+        }
+        const bool zttAggregateFits =
+            fullLastOffset <= static_cast<unsigned __int128>(
+                std::numeric_limits<unsigned>::max() - segmentBytes);
+        const unsigned memSize = zttAggregateFits ?
+            static_cast<unsigned>(fullLastOffset + segmentBytes) : 0;
+        const uint64_t zttAddressMask =
+            static_cast<RiscvISA::ISA *>(xc->tcBase()->getIsaPtr())->rvType() ==
+                RiscvISA::RV32 ? UINT32_MAX : UINT64_MAX;
+        auto zttSegmentAddress = [&](uint64_t segment) {
+            const unsigned __int128 offset =
+                static_cast<unsigned __int128>(segment) * zttStride;
+            return static_cast<Addr>(
+                (static_cast<unsigned __int128>(zttBase) + offset) &
+                zttAddressMask);
+        };
+        // The timing path still uses one aggregate request.  Keep the
+        // geometry helpers available to the atomic path without triggering
+        // -Werror when a generated variant does not use them.
+        (void)memSize;
+        (void)zttSegmentAddress;
+    ''' % ('true' if transposed else 'false')
+
+def zttStridedLoadBehaviour(transposed, timing):
+    memory = '''
+        if (!xc->readMemAccPredicate())
+            return NoFault;
+        const uint8_t *data = pkt->getConstPtr<uint8_t>();
+    ''' if timing else '''
+        std::vector<uint8_t> buffer(segmentCount * segmentBytes, 0);
+        const std::vector<bool> segmentEnable(segmentBytes, true);
+        for (uint64_t segment = 0; segment < segmentCount; ++segment) {
+            Fault fault = xc->readMem(
+                zttSegmentAddress(segment),
+                buffer.data() + segment * segmentBytes, segmentBytes, 0,
+                segmentEnable);
+            if (fault != NoFault)
+                return fault;
+        }
+        const uint8_t *data = buffer.data();
+    '''
+    return zttStridedGeometry(transposed) + memory + '''
+        const uint64_t zttDataSegmentStride = %s;
+        std::array<RiscvISA::MatRegContainer,
+                   RiscvISA::NumZttMatRegs> results{};
+        for (uint32_t i = 0; i < regSpan; ++i)
+            results[i].zero();
+        const uint64_t physicalBits = uint64_t(len) * len *
+            xc->readMiscReg(MISCREG_AMEUDSZ);
+        for (uint32_t square = 0; square < squares; ++square) {
+            for (uint32_t row = 0; row < len; ++row) {
+                for (uint32_t col = 0; col < len; ++col) {
+                    const uint64_t segment = zttTransposed ?
+                        uint64_t(square) * len + col : row;
+                    const uint64_t localBit = zttTransposed ?
+                        uint64_t(row) * type.bits :
+                        (uint64_t(square) * len + col) * type.bits;
+                    const uint64_t segmentBase =
+                        segment * zttDataSegmentStride;
+                    unsigned __int128 value = 0;
+                    for (uint32_t bit = 0; bit < type.bits; ++bit) {
+                        const uint64_t bitOffset = localBit + bit;
+                        value |= static_cast<unsigned __int128>(
+                            (data[segmentBase + bitOffset / 8] >>
+                             (bitOffset & 7)) & 1) << bit;
+                    }
+                    const uint64_t element =
+                        (uint64_t(square) * len + row) * len + col;
+                    zttWriteMOperandElement(results, physicalBits, type,
+                                            element, value);
+                }
+            }
+        }
+        zttDestReg = results[0];
+        for (uint32_t i = 1; i < regSpan; ++i)
+            xc->tcBase()->setReg(
+                RiscvISA::matRegClass[
+                    RiscvISA::ZttMatRegBase + zttRegSelector + i],
+                &results[i]);
+        markDirty(xc);
+    ''' % ('zttStride' if timing else 'segmentBytes')
+
+def zttStridedLoadInitiateBehaviour(transposed):
+    return zttStridedGeometry(transposed) + '''
+        // The native timing interface accepts one contiguous request.  A
+        // wrapped or otherwise non-contiguous transfer is handled by the
+        // atomic path; reject it here rather than indexing a malformed byte
+        // enable vector or issuing a zero-sized request.
+        const uint64_t zttMaxAddress =
+            static_cast<RiscvISA::ISA *>(xc->tcBase()->getIsaPtr())->rvType() ==
+                RiscvISA::RV32 ? UINT32_MAX : UINT64_MAX;
+        const unsigned __int128 zttAggregateExtent =
+            fullLastOffset + segmentBytes - 1;
+        if (!zttAggregateFits ||
+            zttAggregateExtent > zttMaxAddress ||
+            zttBase > zttMaxAddress -
+                static_cast<uint64_t>(zttAggregateExtent))
+            return std::make_shared<AddressFault>(
+                zttBase, LOAD_ACCESS);
+        std::vector<bool> byteEnable(memSize, false);
+        for (uint64_t segment = 0; segment < segmentCount; ++segment)
+            for (uint64_t byte = 0; byte < segmentBytes; ++byte)
+                byteEnable[segment * zttStride + byte] = true;
+        return initiateMemRead(xc, zttBase, memSize, 0, byteEnable);
+    '''
+
+def zttStridedStoreBehaviour(transposed):
+    return zttStridedGeometry(transposed) + '''
+        std::vector<uint8_t> data(segmentCount * segmentBytes, 0);
+        std::array<RiscvISA::MatRegContainer,
+                   RiscvISA::NumZttMatRegs> sources{};
+        sources[0] = zttSrcReg;
+        for (uint32_t i = 1; i < regSpan; ++i)
+            xc->tcBase()->getReg(
+                RiscvISA::matRegClass[
+                    RiscvISA::ZttMatRegBase + zttRegSelector + i],
+                &sources[i]);
+        const uint64_t physicalBits = uint64_t(len) * len *
+            xc->readMiscReg(MISCREG_AMEUDSZ);
+        for (uint32_t segment = 0; segment < segmentCount; ++segment) {
+            std::vector<uint8_t> stagedSegment(segmentBytes, 0);
+            if (zttTransposed) {
+                const uint32_t square = segment / len;
+                const uint32_t col = segment % len;
+                for (uint32_t row = 0; row < len; ++row) {
+                    const uint64_t element =
+                        (uint64_t(square) * len + row) * len + col;
+                    const auto value = zttReadMOperandElement(
+                        sources, physicalBits, type, element);
+                    const uint64_t localBit = uint64_t(row) * type.bits;
+                    for (uint32_t bit = 0; bit < type.bits; ++bit)
+                        stagedSegment[(localBit + bit) / 8] |=
+                            uint8_t((value >> bit) & 1) <<
+                            ((localBit + bit) & 7);
+                }
+            } else {
+                const uint32_t row = segment;
+                for (uint32_t square = 0; square < squares; ++square) {
+                    for (uint32_t col = 0; col < len; ++col) {
+                        const uint64_t element =
+                            (uint64_t(square) * len + row) * len + col;
+                        const auto value = zttReadMOperandElement(
+                            sources, physicalBits, type, element);
+                        const uint64_t localBit =
+                            (uint64_t(square) * len + col) * type.bits;
+                        for (uint32_t bit = 0; bit < type.bits; ++bit)
+                            stagedSegment[(localBit + bit) / 8] |=
+                                uint8_t((value >> bit) & 1) <<
+                                ((localBit + bit) & 7);
+                    }
+                }
+            }
+            const uint64_t segmentBase = uint64_t(segment) * segmentBytes;
+            for (uint64_t byte = 0; byte < segmentBytes; ++byte) {
+                data[segmentBase + byte] = stagedSegment[byte];
+            }
+        }
+        const std::vector<bool> segmentEnable(segmentBytes, true);
+        for (uint64_t segment = 0; segment < segmentCount; ++segment) {
+            Fault fault = xc->writeMem(
+                data.data() + segment * segmentBytes, segmentBytes,
+                zttSegmentAddress(segment), 0, nullptr, segmentEnable);
+            if (fault != NoFault)
+                return fault;
+        }
+        return NoFault;
+    '''
+
+def zttWholeLoadBehaviour(timing):
+    memory = '''
+        if (!xc->readMemAccPredicate())
+            return NoFault;
+        const uint8_t *data = pkt->getConstPtr<uint8_t>();
+    ''' if timing else '''
+        std::array<uint8_t, RiscvISA::MatRegContainer::size()> buffer{};
+        const std::vector<bool> byteEnable(memSize, true);
+        Fault fault = xc->readMem(zttBase, buffer.data(), memSize, 0,
+                                  byteEnable);
+        if (fault != NoFault)
+            return fault;
+        const uint8_t *data = buffer.data();
+    '''
+    return '''
+        const uint64_t len = xc->readMiscReg(MISCREG_AMENLEN);
+        const uint64_t unitBits = xc->readMiscReg(MISCREG_AMEUDSZ);
+        const uint64_t totalBits = len * len * unitBits;
+        if (!len || unitBits < 8 || unitBits %% 8 ||
+            totalBits / 8 > RiscvISA::MatRegContainer::size())
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME whole-register transfer size", machInst);
+        if (zttBase %% (unitBits / 8))
+            return std::make_shared<AddressFault>(
+                zttBase, LOAD_ADDR_MISALIGNED);
+        const uint32_t memSize = totalBits / 8;
+        (void)memSize;
+        %s
+        zttDestReg.zero();
+        auto dest = zttDestReg.as<uint8_t>();
+        for (uint32_t i = 0; i < memSize; ++i)
+            dest[i / MaxMatRowLenInBytes][i %% MaxMatRowLenInBytes] = data[i];
+        markDirty(xc);
+    ''' % memory
+
+def zttWholeLoadInitiateBehaviour():
+    return '''
+        const uint64_t len = xc->readMiscReg(MISCREG_AMENLEN);
+        const uint64_t unitBits = xc->readMiscReg(MISCREG_AMEUDSZ);
+        const uint64_t totalBits = len * len * unitBits;
+        if (!len || unitBits < 8 || unitBits % 8 ||
+            totalBits / 8 > RiscvISA::MatRegContainer::size())
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME whole-register transfer size", machInst);
+        if (zttBase % (unitBits / 8))
+            return std::make_shared<AddressFault>(
+                zttBase, LOAD_ADDR_MISALIGNED);
+        const uint32_t memSize = totalBits / 8;
+        const std::vector<bool> byteEnable(memSize, true);
+        return initiateMemRead(xc, zttBase, memSize, 0, byteEnable);
+    '''
+
+def zttWholeStoreBehaviour():
+    return '''
+        const uint64_t len = xc->readMiscReg(MISCREG_AMENLEN);
+        const uint64_t unitBits = xc->readMiscReg(MISCREG_AMEUDSZ);
+        const uint64_t totalBits = len * len * unitBits;
+        if (!len || unitBits < 8 || unitBits % 8 ||
+            totalBits / 8 > RiscvISA::MatRegContainer::size())
+            return std::make_shared<IllegalInstFault>(
+                "invalid AME whole-register transfer size", machInst);
+        if (zttBase % (unitBits / 8))
+            return std::make_shared<AddressFault>(
+                zttBase, STORE_ADDR_MISALIGNED);
+        const uint32_t memSize = totalBits / 8;
+        std::array<uint8_t, RiscvISA::MatRegContainer::size()> data{};
+        RiscvISA::MatRegContainer source = zttSrcReg;
+        auto bytes = source.as<uint8_t>();
+        for (uint32_t i = 0; i < memSize; ++i)
+            data[i] = bytes[i / MaxMatRowLenInBytes]
+                           [i % MaxMatRowLenInBytes];
+        const std::vector<bool> byteEnable(memSize, true);
+        return xc->writeMem(data.data(), memSize, zttBase, 0, nullptr,
+                            byteEnable);
+    '''
+}};
+
+def format ZttLoadOp(column_major, *flags) {{
+    code = zttLoadTileBehaviour(column_major, False)
+    iop = InstObjParams(name, Name, 'ZttMemStaticInst',
+                        {'code': code,
+                         'initiate_code': zttLoadInitiateBehaviour(),
+                         'initiate_operands': 'ZttMdData; ZttXs1;',
+                         'complete_code':
+                         zttLoadTileBehaviour(column_major, True),
+                         'complete_operands':
+                         'ZttMdReg = zttDestReg; ZttMdData;',
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; ZttXs1;'},
+                        flags + ('IsLoad', 'IsSerializeBefore',
+                                 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const Addr zttBase = ZttXs1;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const RegVal zttDestType = ZttMdData;
+    '''
+    iop.initiate_aliases = '''
+        const Addr zttBase = ZttXs1;
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const RegVal zttDestType = ZttMdData;
+    '''
+    iop.complete_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const Addr zttBase = pkt->req->getVaddr();
+        const uint32_t zttDest = RiscvISA::ZttMatRegBase + ZTT_MD;
+        const RegVal zttDestType = ZttMdData;
+    '''
+    header_output = ZttMemDeclare.subst(iop)
+    decoder_output = ZttMemConstructor.subst(iop)
+    decode_block = ZttMemDecode.subst(iop)
+    exec_output = (ZttMemExecute.subst(iop) +
+                   ZttMemInitiateAcc.subst(iop) +
+                   ZttMemCompleteAcc.subst(iop))
+}};
+
+def format ZttStoreOp(column_major, *flags) {{
+    code = zttStoreTileBehaviour(column_major)
+    iop = InstObjParams(name, Name, 'ZttMemStaticInst',
+                         {'code': code,
+                         'initiate_code': code,
+                         'initiate_operands':
+                         'ZttXs1; ZttStoreMs1Reg; ZttStoreMs1Data;',
+                         'complete_code': 'return NoFault',
+                         'complete_operands': '',
+                         'operands':
+                         'ZttXs1; ZttStoreMs1Reg; ZttStoreMs1Data;'},
+                        flags + ('IsStore', 'IsSerializeBefore',
+                                 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        const auto &zttSrcReg = ZttStoreMs1Reg;
+        const Addr zttBase = ZttXs1;
+        const uint32_t zttSrc =
+            RiscvISA::ZttMatRegBase + ZTT_STORE_MS1;
+        const RegVal zttSrcType = ZttStoreMs1Data;
+    '''
+    iop.initiate_aliases = '''
+        const auto &zttSrcReg = ZttStoreMs1Reg;
+        const Addr zttBase = ZttXs1;
+        const uint32_t zttSrc =
+            RiscvISA::ZttMatRegBase + ZTT_STORE_MS1;
+        const RegVal zttSrcType = ZttStoreMs1Data;
+    '''
+    iop.complete_aliases = ''
+    header_output = ZttMemDeclare.subst(iop)
+    decoder_output = ZttMemConstructor.subst(iop)
+    decode_block = ZttMemDecode.subst(iop)
+    exec_output = (ZttMemExecute.subst(iop) +
+                   ZttMemInitiateAcc.subst(iop) +
+                   ZttMemCompleteAcc.subst(iop))
+}};
+
+def format ZttStridedLoadOp(transposed, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttMemStaticInst',
+                        {'code': zttStridedLoadBehaviour(transposed, False),
+                         'initiate_code':
+                         zttStridedLoadInitiateBehaviour(transposed),
+                         'initiate_operands':
+                         'ZttMdData; ZttXs1; ZttXs2;',
+                         'complete_code':
+                         zttStridedLoadBehaviour(transposed, True),
+                         'complete_operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; ZttXs2;',
+                         'operands':
+                         'ZttMdReg = zttDestReg; ZttMdData; '
+                         'ZttXs1; ZttXs2;'},
+                        flags + ('IsLoad', 'IsSerializeBefore',
+                                 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const Addr zttBase = ZttXs1;
+        const uint64_t zttStride = ZttXs2;
+        const uint32_t zttRegIndex =
+            RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttRegSelector = ZTT_MD;
+        const RegVal zttRegType = ZttMdData;
+        constexpr bool zttIsLoad = true;
+    '''
+    iop.initiate_aliases = '''
+        const Addr zttBase = ZttXs1;
+        const uint64_t zttStride = ZttXs2;
+        const uint32_t zttRegIndex =
+            RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttRegSelector = ZTT_MD;
+        const RegVal zttRegType = ZttMdData;
+        constexpr bool zttIsLoad = true;
+    '''
+    iop.complete_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const Addr zttBase = pkt->req->getVaddr();
+        const uint64_t zttStride = ZttXs2;
+        const uint32_t zttRegIndex =
+            RiscvISA::ZttMatRegBase + ZTT_MD;
+        const uint32_t zttRegSelector = ZTT_MD;
+        const RegVal zttRegType = ZttMdData;
+        constexpr bool zttIsLoad = true;
+    '''
+    header_output = ZttMemDeclare.subst(iop)
+    decoder_output = ZttMemConstructor.subst(iop)
+    decode_block = ZttMemDecode.subst(iop)
+    exec_output = (ZttMemExecute.subst(iop) +
+                   ZttMemInitiateAcc.subst(iop) +
+                   ZttMemCompleteAcc.subst(iop))
+}};
+
+def format ZttStridedStoreOp(transposed, *flags) {{
+    code = zttStridedStoreBehaviour(transposed)
+    iop = InstObjParams(name, Name, 'ZttMemStaticInst',
+                        {'code': code, 'initiate_code': code,
+                         'initiate_operands':
+                         'ZttXs1; ZttXs2; '
+                         'ZttStoreMs1Reg; ZttStoreMs1Data;',
+                         'complete_code': 'return NoFault',
+                         'complete_operands': '',
+                         'operands':
+                         'ZttXs1; ZttXs2; '
+                         'ZttStoreMs1Reg; ZttStoreMs1Data;'},
+                        flags + ('IsStore', 'IsSerializeBefore',
+                                 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        const auto &zttSrcReg = ZttStoreMs1Reg;
+        const Addr zttBase = ZttXs1;
+        const uint64_t zttStride = ZttXs2;
+        const uint32_t zttRegIndex =
+            RiscvISA::ZttMatRegBase + ZTT_STORE_MS1;
+        const uint32_t zttRegSelector = ZTT_STORE_MS1;
+        const RegVal zttRegType = ZttStoreMs1Data;
+        constexpr bool zttIsLoad = false;
+    '''
+    iop.initiate_aliases = iop.ztt_aliases
+    iop.complete_aliases = ''
+    header_output = ZttMemDeclare.subst(iop)
+    decoder_output = ZttMemConstructor.subst(iop)
+    decode_block = ZttMemDecode.subst(iop)
+    exec_output = (ZttMemExecute.subst(iop) +
+                   ZttMemInitiateAcc.subst(iop) +
+                   ZttMemCompleteAcc.subst(iop))
+}};
+
+def format ZttWholeLoadOp(*flags) {{
+    iop = InstObjParams(name, Name, 'ZttMemStaticInst',
+                        {'code': zttWholeLoadBehaviour(False),
+                         'initiate_code': zttWholeLoadInitiateBehaviour(),
+                         'initiate_operands': 'ZttXs1;',
+                         'complete_code': zttWholeLoadBehaviour(True),
+                         'complete_operands': 'ZttMdReg = zttDestReg;',
+                         'operands': 'ZttMdReg = zttDestReg; ZttXs1;'},
+                        flags + ('IsLoad', 'IsSerializeBefore',
+                                 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const Addr zttBase = ZttXs1;
+    '''
+    iop.initiate_aliases = 'const Addr zttBase = ZttXs1;'
+    iop.complete_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        const Addr zttBase = pkt->req->getVaddr();
+    '''
+    header_output = ZttMemDeclare.subst(iop)
+    decoder_output = ZttMemConstructor.subst(iop)
+    decode_block = ZttMemDecode.subst(iop)
+    exec_output = (ZttMemExecute.subst(iop) +
+                   ZttMemInitiateAcc.subst(iop) +
+                   ZttMemCompleteAcc.subst(iop))
+}};
+
+def format ZttWholeStoreOp(*flags) {{
+    code = zttWholeStoreBehaviour()
+    iop = InstObjParams(name, Name, 'ZttMemStaticInst',
+                        {'code': code, 'initiate_code': code,
+                         'initiate_operands': 'ZttXs1; ZttStoreMs1Reg;',
+                         'complete_code': 'return NoFault',
+                         'complete_operands': '',
+                         'operands': 'ZttXs1; ZttStoreMs1Reg;'},
+                        flags + ('IsStore', 'IsSerializeBefore',
+                                 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        const auto &zttSrcReg = ZttStoreMs1Reg;
+        const Addr zttBase = ZttXs1;
+    '''
+    iop.initiate_aliases = iop.ztt_aliases
+    iop.complete_aliases = ''
+    header_output = ZttMemDeclare.subst(iop)
+    decoder_output = ZttMemConstructor.subst(iop)
+    decode_block = ZttMemDecode.subst(iop)
+    exec_output = (ZttMemExecute.subst(iop) +
+                   ZttMemInitiateAcc.subst(iop) +
+                   ZttMemCompleteAcc.subst(iop))
+}};

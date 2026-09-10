@@ -1,0 +1,1581 @@
+// -*- mode:c++ -*-
+
+// Copyright (c) 2026 BOSC & ICT, CAS
+// All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met: redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer;
+// redistributions in binary form must reproduce the above copyright
+// notice, this list of conditions and the following disclaimer in the
+// documentation and/or other materials provided with the distribution;
+// neither the name of the copyright holders nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+// Ztt v0.6 configuration instructions and shared CSR/type state.
+//
+// Ztt tile dimensions are defined exclusively by AMENLEN.  Unlike the
+// RVMatrix extension, Ztt has no MLENB or MRLENB configuration instructions.
+
+// ================== Ztt configuration instruction support =================
+output header {{
+class ZttStaticInst : public RiscvStaticInst
+{
+  protected:
+    ZttStaticInst(const char *mnem, ExtMachInst machInst, OpClass opClass)
+        : RiscvStaticInst(mnem, machInst, opClass)
+    {}
+
+    Fault
+    checkAccess(ExecContext *xc, bool requireOwner = true) const
+    {
+        return RiscvISA::checkAMEEnabled(xc, machInst, requireOwner);
+    }
+
+    void
+    markDirty(ExecContext *xc) const
+    {
+        RiscvISA::markAMEDirty(xc);
+    }
+
+    std::string generateDisassembly(
+        Addr pc, const loader::SymbolTable *symtab) const override
+    {
+        return std::string(mnemonic);
+    }
+};
+
+class ZttConfStaticInst : public ZttStaticInst
+{
+  protected:
+    ZttConfStaticInst(const char *mnem, ExtMachInst machInst, OpClass opClass)
+        : ZttStaticInst(mnem, machInst, opClass)
+    {}
+};
+}};
+
+// Shared datatype decoding and matrix-register primitives are emitted with
+// the instruction declarations.  Execute output is reserved for the per-op
+// behaviour specified in decoder.isa.
+output header {{
+#include <array>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <limits>
+
+#include "arch/riscv/isa.hh"
+#include "arch/riscv/regs/matrix.hh"
+#include "cpu/thread_context.hh"
+
+namespace
+{
+
+enum class ZttElemType {
+    Invalid, Fp8E4M3, Fp8E5M2, Fp16, Bf16, Fp32, Fp64,
+    I4, U4, I8, U8, I16, U16, I32, U32, I64, U64, I128, U128
+};
+
+enum class ZttRoundingMode : uint8_t {
+    Rne = 0, Rtz = 1, Rdn = 2, Rup = 3, Rmm = 4, Rno = 5
+};
+
+enum class ZttIntegerRoundingMode : uint8_t {
+    Rnu = 0, Rne = 1, Rdn = 2, Rod = 3
+};
+
+struct ZttTypeInfo
+{
+    ZttElemType kind = ZttElemType::Invalid;
+    uint32_t bits = 0;
+    uint32_t bytes = 0;
+    bool isSigned = false;
+    bool isFloating = false;
+    bool saturating = false;
+    ZttIntegerRoundingMode integerRounding =
+        ZttIntegerRoundingMode::Rnu;
+    uint32_t expWidth = 0;
+    ZttRoundingMode rounding = ZttRoundingMode::Rne;
+    bool hasInfinity = false;
+    bool hasDenormals = false;
+};
+
+constexpr uint32_t ZttCustomBit = 1U << 31;
+constexpr uint32_t ZttIntegerSignBit = 1U << 30;
+constexpr uint32_t ZttIntegerSaturationBit = 1U << 29;
+constexpr uint32_t ZttIntegerRoundingMask = 0x18000000U;
+constexpr uint32_t ZttIntegerReservedMask = 0x07fffe00U;
+constexpr uint32_t ZttFpExpMask = 0x7c000000U;
+constexpr uint32_t ZttFpRoundingMask = 0x03c00000U;
+constexpr uint32_t ZttFpInfinityBit = 1U << 21;
+constexpr uint32_t ZttFpDenormalBit = 1U << 20;
+constexpr uint32_t ZttFpReservedMask = 0x000ffe00U;
+constexpr uint32_t ZttFpSpecifierBit = 1U << 8;
+constexpr uint32_t ZttFpFlagNX = 1U << 0;
+constexpr uint32_t ZttFpFlagUF = 1U << 1;
+constexpr uint32_t ZttFpFlagOF = 1U << 2;
+constexpr uint32_t ZttFpFlagDZ = 1U << 3;
+constexpr uint32_t ZttFpFlagNV = 1U << 4;
+
+struct ZttPendingEffects
+{
+    // Collected while an instruction builds its result; published only after
+    // the destination writeback path has completed.
+    uint32_t fpFlags = 0;
+    bool saturated = false;
+
+    void
+    commit(ExecContext *xc) const
+    {
+        if (fpFlags) {
+            xc->setMiscReg(
+                MISCREG_AMEFFLAGS,
+                (xc->readMiscReg(MISCREG_AMEFFLAGS) | fpFlags) & 0x1f);
+        }
+        if (saturated)
+            xc->setMiscReg(MISCREG_AMEXSAT, 1);
+    }
+};
+
+class ZttFpEnv
+{
+  private:
+    uint_fast8_t savedRoundingMode;
+    uint_fast8_t savedTininessMode;
+    uint_fast8_t savedExceptionFlags;
+    ZttPendingEffects pending;
+
+    static uint_fast8_t
+    softRoundingMode(ZttRoundingMode mode)
+    {
+        switch (mode) {
+        case ZttRoundingMode::Rne: return softfloat_round_near_even;
+        case ZttRoundingMode::Rtz: return softfloat_round_minMag;
+        case ZttRoundingMode::Rdn: return softfloat_round_min;
+        case ZttRoundingMode::Rup: return softfloat_round_max;
+        case ZttRoundingMode::Rmm: return softfloat_round_near_maxMag;
+        case ZttRoundingMode::Rno: return softfloat_round_odd;
+        }
+        return softfloat_round_near_even;
+    }
+
+    void
+    captureSoftFloatFlags()
+    {
+        if (softfloat_exceptionFlags & softfloat_flag_inexact)
+            pending.fpFlags |= ZttFpFlagNX;
+        if (softfloat_exceptionFlags & softfloat_flag_underflow)
+            pending.fpFlags |= ZttFpFlagUF;
+        if (softfloat_exceptionFlags & softfloat_flag_overflow)
+            pending.fpFlags |= ZttFpFlagOF;
+        if (softfloat_exceptionFlags & softfloat_flag_infinite)
+            pending.fpFlags |= ZttFpFlagDZ;
+        if (softfloat_exceptionFlags & softfloat_flag_invalid)
+            pending.fpFlags |= ZttFpFlagNV;
+    }
+
+  public:
+    ZttFpEnv()
+        : savedRoundingMode(softfloat_roundingMode),
+          savedTininessMode(softfloat_detectTininess),
+          savedExceptionFlags(softfloat_exceptionFlags)
+    {
+        softfloat_roundingMode = softfloat_round_near_even;
+        softfloat_detectTininess = softfloat_tininess_afterRounding;
+        softfloat_exceptionFlags = 0;
+    }
+
+    ZttFpEnv(const ZttFpEnv &) = delete;
+    ZttFpEnv &operator=(const ZttFpEnv &) = delete;
+
+    ~ZttFpEnv()
+    {
+        softfloat_roundingMode = savedRoundingMode;
+        softfloat_detectTininess = savedTininessMode;
+        softfloat_exceptionFlags = savedExceptionFlags;
+    }
+
+    void
+    setRounding(ZttRoundingMode mode)
+    {
+        softfloat_roundingMode = softRoundingMode(mode);
+    }
+
+    uint_fast8_t
+    roundingMode(ZttRoundingMode mode) const
+    {
+        return softRoundingMode(mode);
+    }
+
+    void
+    accrueFpFlags(uint32_t flags)
+    {
+        pending.fpFlags |= flags & 0x1f;
+    }
+
+    void
+    accrueSaturation()
+    {
+        pending.saturated = true;
+    }
+
+    void
+    commit(ExecContext *xc)
+    {
+        captureSoftFloatFlags();
+        pending.commit(xc);
+    }
+};
+
+inline void
+zttAccrueFpFlags(ZttFpEnv &fpEnv, uint32_t flags)
+{
+    fpEnv.accrueFpFlags(flags);
+}
+
+inline void
+zttAccrueSaturation(ZttFpEnv &fpEnv)
+{
+    fpEnv.accrueSaturation();
+}
+
+inline uint64_t
+zttBitMask(uint32_t bits)
+{
+    return bits == 64 ? std::numeric_limits<uint64_t>::max() :
+                        ((uint64_t(1) << bits) - 1);
+}
+
+inline unsigned __int128
+zttBitMask128(uint32_t bits)
+{
+    return bits == 128 ? ~static_cast<unsigned __int128>(0) :
+                         ((static_cast<unsigned __int128>(1) << bits) - 1);
+}
+
+inline bool
+zttIsNativeSoftFloatType(const ZttTypeInfo &type)
+{
+    if (!type.isFloating || !type.hasInfinity || !type.hasDenormals)
+        return false;
+    return (type.kind == ZttElemType::Fp16 && type.bits == 16 &&
+            type.expWidth == 5) ||
+           (type.kind == ZttElemType::Fp32 && type.bits == 32 &&
+            type.expWidth == 8) ||
+           (type.kind == ZttElemType::Fp64 && type.bits == 64 &&
+            type.expWidth == 11);
+}
+
+inline bool
+zttIsNarrowFloatType(const ZttTypeInfo &type)
+{
+    return type.isFloating &&
+        (type.kind == ZttElemType::Bf16 ||
+         type.kind == ZttElemType::Fp8E4M3 ||
+         type.kind == ZttElemType::Fp8E5M2);
+}
+
+inline bool
+zttIsSoftFloatType(const ZttTypeInfo &type)
+{
+    return zttIsNativeSoftFloatType(type) || zttIsNarrowFloatType(type);
+}
+
+inline RiscvISA::ZttNarrowFloatFormat
+zttNarrowFloatFormat(const ZttTypeInfo &type)
+{
+    switch (type.kind) {
+    case ZttElemType::Bf16:
+        return RiscvISA::ZttNarrowFloatFormat::Bf16;
+    case ZttElemType::Fp8E4M3:
+        return RiscvISA::ZttNarrowFloatFormat::E4M3;
+    case ZttElemType::Fp8E5M2:
+        return RiscvISA::ZttNarrowFloatFormat::E5M2;
+    default:
+        return RiscvISA::ZttNarrowFloatFormat::Bf16;
+    }
+}
+
+inline RiscvISA::ZttFloatRoundingMode
+zttBackendRounding(ZttRoundingMode mode)
+{
+    return static_cast<RiscvISA::ZttFloatRoundingMode>(mode);
+}
+
+inline bool
+zttSameFloatEncoding(const ZttTypeInfo &lhs, const ZttTypeInfo &rhs)
+{
+    return lhs.kind == rhs.kind && lhs.bits == rhs.bits &&
+           lhs.expWidth == rhs.expWidth &&
+           lhs.hasInfinity == rhs.hasInfinity &&
+           lhs.hasDenormals == rhs.hasDenormals;
+}
+
+inline bool
+zttIsStandardFloatType(const ZttTypeInfo &type)
+{
+    return type.isFloating &&
+           (type.kind == ZttElemType::Fp8E4M3 ||
+            type.kind == ZttElemType::Fp8E5M2 ||
+            type.kind == ZttElemType::Fp16 ||
+            type.kind == ZttElemType::Bf16 ||
+            type.kind == ZttElemType::Fp32 ||
+            type.kind == ZttElemType::Fp64);
+}
+
+inline bool
+zttIsSupportedFloatType(const ZttTypeInfo &type)
+{
+    // All standard formats have deterministic software floating-point
+    // semantics. BF16 and FP8 are adapted through ZttFloatBackend.
+    return zttIsStandardFloatType(type);
+}
+
+inline uint64_t
+zttFloatFraction(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    return static_cast<uint64_t>(raw) & zttBitMask(type.bits -
+                                                    type.expWidth - 1);
+}
+
+inline uint64_t
+zttFloatExponent(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    const uint32_t fractionBits = type.bits - type.expWidth - 1;
+    return (static_cast<uint64_t>(raw) >> fractionBits) &
+           zttBitMask(type.expWidth);
+}
+
+inline bool
+zttFloatIsNaN(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    if (!zttIsStandardFloatType(type))
+        return false;
+    if (zttIsNarrowFloatType(type)) {
+        return RiscvISA::ZttFloatBackend::isNaN(
+            static_cast<uint16_t>(raw), zttNarrowFloatFormat(type));
+    }
+    const uint64_t fraction = zttFloatFraction(raw, type);
+    const uint64_t exponent = zttFloatExponent(raw, type);
+    return exponent == zttBitMask(type.expWidth) && fraction != 0;
+}
+
+inline bool
+zttFloatIsSignalingNaN(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    if (zttIsNarrowFloatType(type)) {
+        return RiscvISA::ZttFloatBackend::isSignalingNaN(
+            static_cast<uint16_t>(raw), zttNarrowFloatFormat(type));
+    }
+    if (!zttFloatIsNaN(raw, type))
+        return false;
+    const uint32_t fractionBits = type.bits - type.expWidth - 1;
+    return !(static_cast<uint64_t>(raw) & (uint64_t(1) <<
+                                             (fractionBits - 1)));
+}
+
+inline unsigned __int128
+zttFloatCanonicalNaN(const ZttTypeInfo &type)
+{
+    if (zttIsNarrowFloatType(type)) {
+        return RiscvISA::ZttFloatBackend::canonicalNaN(
+            zttNarrowFloatFormat(type));
+    }
+    const uint32_t fractionBits = type.bits - type.expWidth - 1;
+    return (static_cast<unsigned __int128>(zttBitMask(type.expWidth)) <<
+            fractionBits) | (static_cast<unsigned __int128>(1) <<
+                              (fractionBits - 1));
+}
+
+inline bool
+zttSoftFloatIsNaN(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    return zttFloatIsNaN(raw, type);
+}
+
+inline bool
+zttSoftFloatIsSignalingNaN(unsigned __int128 raw,
+                           const ZttTypeInfo &type)
+{
+    return zttFloatIsSignalingNaN(raw, type);
+}
+
+inline unsigned __int128
+zttSoftFloatCanonicalNaN(const ZttTypeInfo &type)
+{
+    return zttFloatCanonicalNaN(type);
+}
+
+inline unsigned __int128
+zttFloatOne(const ZttTypeInfo &type)
+{
+    if (zttIsNarrowFloatType(type)) {
+        return RiscvISA::ZttFloatBackend::one(
+            zttNarrowFloatFormat(type));
+    }
+    if (type.kind == ZttElemType::Fp16)
+        return 0x3c00U;
+    if (type.kind == ZttElemType::Fp32)
+        return 0x3f800000U;
+    return 0x3ff0000000000000ULL;
+}
+
+inline bool
+zttSoftFloatCanWiden(const ZttTypeInfo &source,
+                     const ZttTypeInfo &dest)
+{
+    if (!zttIsSoftFloatType(source) || !zttIsSoftFloatType(dest))
+        return false;
+    if (zttSameFloatEncoding(source, dest))
+        return true;
+    if (dest.kind == ZttElemType::Fp64)
+        return true;
+    if (dest.kind == ZttElemType::Fp32)
+        return source.kind != ZttElemType::Fp64;
+    if (dest.kind == ZttElemType::Fp16) {
+        return source.kind == ZttElemType::Fp8E4M3 ||
+               source.kind == ZttElemType::Fp8E5M2;
+    }
+    if (dest.kind == ZttElemType::Bf16) {
+        return source.kind == ZttElemType::Fp8E4M3 ||
+               source.kind == ZttElemType::Fp8E5M2;
+    }
+    return false;
+}
+
+inline bool
+zttSoftFloatCompatible(const ZttTypeInfo &source,
+                        const ZttTypeInfo &dest)
+{
+    return zttIsSoftFloatType(source) && zttIsSoftFloatType(dest);
+}
+
+inline unsigned __int128
+zttSoftFloatConvert(unsigned __int128 raw, const ZttTypeInfo &source,
+                    const ZttTypeInfo &dest, ZttFpEnv &fpEnv)
+{
+    fpEnv.setRounding(dest.rounding);
+    if (zttSoftFloatIsNaN(raw, source)) {
+        if (zttSoftFloatIsSignalingNaN(raw, source))
+            fpEnv.accrueFpFlags(ZttFpFlagNV);
+        return zttSoftFloatCanonicalNaN(dest);
+    }
+
+    const uint64_t value = static_cast<uint64_t>(raw);
+    if (zttSameFloatEncoding(source, dest))
+        return value;
+
+    if (zttIsNarrowFloatType(source) && zttIsNarrowFloatType(dest)) {
+        return RiscvISA::ZttFloatBackend::convert(
+            static_cast<uint16_t>(value), zttNarrowFloatFormat(source),
+            zttNarrowFloatFormat(dest), zttBackendRounding(dest.rounding));
+    }
+    if (zttIsNarrowFloatType(source)) {
+        const float32_t carrier = RiscvISA::ZttFloatBackend::toF32(
+            static_cast<uint16_t>(value), zttNarrowFloatFormat(source));
+        if (dest.kind == ZttElemType::Fp16)
+            return f32_to_f16(carrier).v;
+        if (dest.kind == ZttElemType::Fp32)
+            return carrier.v;
+        if (dest.kind == ZttElemType::Fp64)
+            return f32_to_f64(carrier).v;
+        return 0;
+    }
+    if (zttIsNarrowFloatType(dest)) {
+        float32_t carrier{};
+        if (source.kind == ZttElemType::Fp16) {
+            carrier = f16_to_f32(float16_t{static_cast<uint16_t>(value)});
+        } else if (source.kind == ZttElemType::Fp32) {
+            carrier = float32_t{static_cast<uint32_t>(value)};
+        } else if (source.kind == ZttElemType::Fp64) {
+            // Round-to-odd preserves discarded information for the final
+            // conversion to a lower-precision BF16/FP8 destination.
+            fpEnv.setRounding(ZttRoundingMode::Rno);
+            carrier = f64_to_f32(float64_t{value});
+        } else {
+            return 0;
+        }
+        return RiscvISA::ZttFloatBackend::fromF32(
+            carrier, zttNarrowFloatFormat(dest),
+            zttBackendRounding(dest.rounding));
+    }
+
+    if (source.kind == ZttElemType::Fp16 &&
+        dest.kind == ZttElemType::Fp32)
+        return f16_to_f32(float16_t{static_cast<uint16_t>(value)}).v;
+    if (source.kind == ZttElemType::Fp16 &&
+        dest.kind == ZttElemType::Fp64)
+        return f16_to_f64(float16_t{static_cast<uint16_t>(value)}).v;
+    if (source.kind == ZttElemType::Fp32 &&
+        dest.kind == ZttElemType::Fp16)
+        return f32_to_f16(float32_t{static_cast<uint32_t>(value)}).v;
+    if (source.kind == ZttElemType::Fp32 &&
+        dest.kind == ZttElemType::Fp64)
+        return f32_to_f64(float32_t{static_cast<uint32_t>(value)}).v;
+    if (source.kind == ZttElemType::Fp64 &&
+        dest.kind == ZttElemType::Fp16)
+        return f64_to_f16(float64_t{value}).v;
+    if (source.kind == ZttElemType::Fp64 &&
+        dest.kind == ZttElemType::Fp32)
+        return f64_to_f32(float64_t{value}).v;
+    return 0;
+}
+
+enum class ZttSoftBinaryOp : uint8_t { Add, Sub, Mul, Div };
+
+inline unsigned __int128
+zttSoftFloatBinary(unsigned __int128 lhs, unsigned __int128 rhs,
+                   const ZttTypeInfo &type, ZttSoftBinaryOp op,
+                   ZttFpEnv &fpEnv)
+{
+    fpEnv.setRounding(type.rounding);
+    if (zttIsNarrowFloatType(type)) {
+        RiscvISA::ZttFloatBinaryOp backendOp =
+            RiscvISA::ZttFloatBinaryOp::Add;
+        switch (op) {
+        case ZttSoftBinaryOp::Add:
+            backendOp = RiscvISA::ZttFloatBinaryOp::Add; break;
+        case ZttSoftBinaryOp::Sub:
+            backendOp = RiscvISA::ZttFloatBinaryOp::Sub; break;
+        case ZttSoftBinaryOp::Mul:
+            backendOp = RiscvISA::ZttFloatBinaryOp::Mul; break;
+        case ZttSoftBinaryOp::Div:
+            backendOp = RiscvISA::ZttFloatBinaryOp::Div; break;
+        }
+        return RiscvISA::ZttFloatBackend::binary(
+            static_cast<uint16_t>(lhs), static_cast<uint16_t>(rhs),
+            zttNarrowFloatFormat(type), zttBackendRounding(type.rounding),
+            backendOp);
+    }
+    if (type.kind == ZttElemType::Fp16) {
+        const float16_t a{static_cast<uint16_t>(lhs)};
+        const float16_t b{static_cast<uint16_t>(rhs)};
+        switch (op) {
+        case ZttSoftBinaryOp::Add: return f16_add(a, b).v;
+        case ZttSoftBinaryOp::Sub: return f16_sub(a, b).v;
+        case ZttSoftBinaryOp::Mul: return f16_mul(a, b).v;
+        case ZttSoftBinaryOp::Div: return f16_div(a, b).v;
+        }
+    } else if (type.kind == ZttElemType::Fp32) {
+        const float32_t a{static_cast<uint32_t>(lhs)};
+        const float32_t b{static_cast<uint32_t>(rhs)};
+        switch (op) {
+        case ZttSoftBinaryOp::Add: return f32_add(a, b).v;
+        case ZttSoftBinaryOp::Sub: return f32_sub(a, b).v;
+        case ZttSoftBinaryOp::Mul: return f32_mul(a, b).v;
+        case ZttSoftBinaryOp::Div: return f32_div(a, b).v;
+        }
+    } else {
+        const float64_t a{static_cast<uint64_t>(lhs)};
+        const float64_t b{static_cast<uint64_t>(rhs)};
+        switch (op) {
+        case ZttSoftBinaryOp::Add: return f64_add(a, b).v;
+        case ZttSoftBinaryOp::Sub: return f64_sub(a, b).v;
+        case ZttSoftBinaryOp::Mul: return f64_mul(a, b).v;
+        case ZttSoftBinaryOp::Div: return f64_div(a, b).v;
+        }
+    }
+    return 0;
+}
+
+inline unsigned __int128
+zttSoftFloatMulAdd(unsigned __int128 lhs, unsigned __int128 rhs,
+                   unsigned __int128 addend, const ZttTypeInfo &type,
+                   ZttFpEnv &fpEnv)
+{
+    fpEnv.setRounding(type.rounding);
+    if (zttIsNarrowFloatType(type)) {
+        return RiscvISA::ZttFloatBackend::mulAdd(
+            static_cast<uint16_t>(lhs), static_cast<uint16_t>(rhs),
+            static_cast<uint16_t>(addend), zttNarrowFloatFormat(type),
+            zttBackendRounding(type.rounding));
+    }
+    if (type.kind == ZttElemType::Fp16) {
+        return f16_mulAdd(float16_t{static_cast<uint16_t>(lhs)},
+                          float16_t{static_cast<uint16_t>(rhs)},
+                          float16_t{static_cast<uint16_t>(addend)}).v;
+    }
+    if (type.kind == ZttElemType::Fp32) {
+        return f32_mulAdd(float32_t{static_cast<uint32_t>(lhs)},
+                          float32_t{static_cast<uint32_t>(rhs)},
+                          float32_t{static_cast<uint32_t>(addend)}).v;
+    }
+    return f64_mulAdd(float64_t{static_cast<uint64_t>(lhs)},
+                      float64_t{static_cast<uint64_t>(rhs)},
+                      float64_t{static_cast<uint64_t>(addend)}).v;
+}
+
+inline unsigned __int128
+zttSoftFloatSqrt(unsigned __int128 raw, const ZttTypeInfo &type,
+                 ZttFpEnv &fpEnv)
+{
+    fpEnv.setRounding(type.rounding);
+    if (zttIsNarrowFloatType(type)) {
+        return RiscvISA::ZttFloatBackend::sqrt(
+            static_cast<uint16_t>(raw), zttNarrowFloatFormat(type),
+            zttBackendRounding(type.rounding));
+    }
+    if (type.kind == ZttElemType::Fp16)
+        return f16_sqrt(float16_t{static_cast<uint16_t>(raw)}).v;
+    if (type.kind == ZttElemType::Fp32)
+        return f32_sqrt(float32_t{static_cast<uint32_t>(raw)}).v;
+    return f64_sqrt(float64_t{static_cast<uint64_t>(raw)}).v;
+}
+
+inline unsigned __int128
+zttSoftFloatRoundToInt(unsigned __int128 raw, const ZttTypeInfo &type,
+                       ZttRoundingMode rounding, ZttFpEnv &fpEnv)
+{
+    const uint_fast8_t mode = fpEnv.roundingMode(rounding);
+    if (zttIsNarrowFloatType(type)) {
+        return RiscvISA::ZttFloatBackend::roundToInt(
+            static_cast<uint16_t>(raw), zttNarrowFloatFormat(type),
+            zttBackendRounding(rounding));
+    }
+    if (type.kind == ZttElemType::Fp16) {
+        return f16_roundToInt(
+            float16_t{static_cast<uint16_t>(raw)}, mode, true).v;
+    }
+    if (type.kind == ZttElemType::Fp32) {
+        return f32_roundToInt(
+            float32_t{static_cast<uint32_t>(raw)}, mode, true).v;
+    }
+    return f64_roundToInt(float64_t{static_cast<uint64_t>(raw)}, mode,
+                          true).v;
+}
+
+inline bool
+zttSoftFloatLess(unsigned __int128 lhs, unsigned __int128 rhs,
+                 const ZttTypeInfo &type)
+{
+    if (zttIsNarrowFloatType(type)) {
+        return RiscvISA::ZttFloatBackend::less(
+            static_cast<uint16_t>(lhs), static_cast<uint16_t>(rhs),
+            zttNarrowFloatFormat(type));
+    }
+    if (type.kind == ZttElemType::Fp16) {
+        return f16_lt_quiet(float16_t{static_cast<uint16_t>(lhs)},
+                            float16_t{static_cast<uint16_t>(rhs)});
+    }
+    if (type.kind == ZttElemType::Fp32) {
+        return f32_lt_quiet(float32_t{static_cast<uint32_t>(lhs)},
+                            float32_t{static_cast<uint32_t>(rhs)});
+    }
+    return f64_lt_quiet(float64_t{static_cast<uint64_t>(lhs)},
+                        float64_t{static_cast<uint64_t>(rhs)});
+}
+
+inline bool
+zttSoftFloatLessEqual(unsigned __int128 lhs, unsigned __int128 rhs,
+                      const ZttTypeInfo &type)
+{
+    if (zttIsNarrowFloatType(type)) {
+        return RiscvISA::ZttFloatBackend::lessEqual(
+            static_cast<uint16_t>(lhs), static_cast<uint16_t>(rhs),
+            zttNarrowFloatFormat(type));
+    }
+    if (type.kind == ZttElemType::Fp16) {
+        return f16_le_quiet(float16_t{static_cast<uint16_t>(lhs)},
+                            float16_t{static_cast<uint16_t>(rhs)});
+    }
+    if (type.kind == ZttElemType::Fp32) {
+        return f32_le_quiet(float32_t{static_cast<uint32_t>(lhs)},
+                            float32_t{static_cast<uint32_t>(rhs)});
+    }
+    return f64_le_quiet(float64_t{static_cast<uint64_t>(lhs)},
+                        float64_t{static_cast<uint64_t>(rhs)});
+}
+
+inline void
+zttSetUnsupported(ExecContext *xc)
+{
+    xc->setMiscReg(MISCREG_AMESTATUS,
+                   xc->readMiscReg(MISCREG_AMESTATUS) | 0x1);
+    RiscvISA::markAMEDirty(xc);
+}
+
+inline bool
+zttCheckStructuralReg(ExecContext *xc, uint32_t idx, bool accumulator)
+{
+    const uint32_t first = accumulator ? RiscvISA::ZttAccStructuralIndexBase :
+                                         0;
+    const uint32_t count = accumulator ? RiscvISA::NumZttAccRegs :
+                                         RiscvISA::NumZttMatRegs;
+    if (idx < first || idx >= first + count) {
+        zttSetUnsupported(xc);
+        return false;
+    }
+    return true;
+}
+
+inline bool
+zttDecodeType(ExecContext *xc, RegVal raw, ZttTypeInfo &info)
+{
+    // Standard datatype descriptors are an enumerated architectural
+    // namespace, not a generic configurable floating-point format.
+    const uint64_t raw64 = static_cast<uint64_t>(raw);
+    if (raw64 >> 32) {
+        zttSetUnsupported(xc);
+        return false;
+    }
+
+    const uint32_t value = static_cast<uint32_t>(raw);
+    const uint32_t bits = value & 0xff;
+    if (value == 0 || value & ZttCustomBit) {
+        zttSetUnsupported(xc);
+        return false;
+    }
+
+    info = ZttTypeInfo{};
+    info.bits = bits;
+    info.bytes = (bits + 7) / 8;
+
+    if ((value & ZttFpSpecifierBit) == 0) {
+        if ((value & ZttIntegerReservedMask) != 0 ||
+            (bits != 4 && bits != 8 && bits != 16 && bits != 32 &&
+             bits != 64 && bits != 128)) {
+            zttSetUnsupported(xc);
+            return false;
+        }
+        info.isSigned = value & ZttIntegerSignBit;
+        info.saturating = value & ZttIntegerSaturationBit;
+        info.integerRounding = static_cast<ZttIntegerRoundingMode>(
+            (value & ZttIntegerRoundingMask) >> 27);
+        if (static_cast<uint32_t>(info.integerRounding) >
+            static_cast<uint32_t>(ZttIntegerRoundingMode::Rod)) {
+            zttSetUnsupported(xc);
+            return false;
+        }
+        switch (bits) {
+        case 4:
+            info.kind = info.isSigned ? ZttElemType::I4 : ZttElemType::U4;
+            break;
+        case 8:
+            info.kind = info.isSigned ? ZttElemType::I8 : ZttElemType::U8;
+            break;
+        case 16:
+            info.kind = info.isSigned ? ZttElemType::I16 : ZttElemType::U16;
+            break;
+        case 32:
+            info.kind = info.isSigned ? ZttElemType::I32 : ZttElemType::U32;
+            break;
+        case 64:
+            info.kind = info.isSigned ? ZttElemType::I64 : ZttElemType::U64;
+            break;
+        case 128:
+            info.kind = info.isSigned ? ZttElemType::I128 : ZttElemType::U128;
+            break;
+        }
+        return true;
+    }
+
+    const uint32_t rounding = (value & ZttFpRoundingMask) >> 22;
+    const uint32_t expWidth = (value & ZttFpExpMask) >> 26;
+    const bool hasInfinity = value & ZttFpInfinityBit;
+    const bool hasDenormals = value & ZttFpDenormalBit;
+    const bool fp16 = bits == 16 && expWidth == 5 && hasInfinity &&
+                      hasDenormals;
+    const bool bf16 = bits == 16 && expWidth == 8 && hasInfinity &&
+                      hasDenormals;
+    const bool fp32 = bits == 32 && expWidth == 8 && hasInfinity &&
+                      hasDenormals;
+    const bool fp64 = bits == 64 && expWidth == 11 && hasInfinity &&
+                      hasDenormals;
+    const bool e4m3 = bits == 8 && expWidth == 4 && !hasInfinity &&
+                      hasDenormals;
+    const bool e5m2 = bits == 8 && expWidth == 5 && hasInfinity &&
+                      hasDenormals;
+    if ((value & ZttFpReservedMask) != 0 ||
+        rounding > static_cast<uint32_t>(ZttRoundingMode::Rno) ||
+        !(fp16 || bf16 || fp32 || fp64 || e4m3 || e5m2)) {
+        zttSetUnsupported(xc);
+        return false;
+    }
+
+    info.isFloating = true;
+    info.isSigned = true;
+    info.expWidth = expWidth;
+    info.rounding = static_cast<ZttRoundingMode>(rounding);
+    info.hasInfinity = hasInfinity;
+    info.hasDenormals = hasDenormals;
+    if (e4m3)
+        info.kind = ZttElemType::Fp8E4M3;
+    else if (e5m2)
+        info.kind = ZttElemType::Fp8E5M2;
+    else if (fp16)
+        info.kind = ZttElemType::Fp16;
+    else if (bf16)
+        info.kind = ZttElemType::Bf16;
+    else if (fp32)
+        info.kind = ZttElemType::Fp32;
+    else if (fp64)
+        info.kind = ZttElemType::Fp64;
+    return true;
+}
+
+inline bool
+zttTypeCanExecute(const ZttTypeInfo &type)
+{
+    // The register container is bit-addressable and represents up to 128 bits
+    // per element.  Int128 multiply-accumulate retains the architectural low
+    // 128 bits, so it does not require a 256-bit storage type.
+    return type.bits >= 4 && type.bits <= 128;
+}
+
+inline bool
+zttGetDatatype(ExecContext *xc, uint32_t idx, bool accumulator, RegVal raw,
+               ZttTypeInfo &info)
+{
+    return zttCheckStructuralReg(xc, idx, accumulator) &&
+           zttDecodeType(xc, raw, info);
+}
+
+inline bool
+zttTileLen(ExecContext *xc, const ZttTypeInfo &type, uint32_t &len)
+{
+    const RegVal configuredLen = xc->readMiscReg(MISCREG_AMENLEN);
+    if (configuredLen == 0 || configuredLen > UINT32_MAX ||
+        !zttTypeCanExecute(type)) {
+        zttSetUnsupported(xc);
+        return false;
+    }
+    len = static_cast<uint32_t>(configuredLen);
+    const uint64_t tileBits = uint64_t(len) * len * type.bits;
+    if (tileBits > RiscvISA::MatRegContainer::size() * 8) {
+        zttSetUnsupported(xc);
+        return false;
+    }
+    return true;
+}
+
+inline bool
+zttPackFactor(ExecContext *xc, const ZttTypeInfo &type, uint32_t &factor)
+{
+    const RegVal configuredUnitBits = xc->readMiscReg(MISCREG_AMEUDSZ);
+    if (configuredUnitBits == 0 || configuredUnitBits > UINT32_MAX) {
+        zttSetUnsupported(xc);
+        return false;
+    }
+    const uint32_t unitBits = static_cast<uint32_t>(configuredUnitBits);
+    if (type.bits < unitBits) {
+        if (unitBits % type.bits) {
+            zttSetUnsupported(xc);
+            return false;
+        }
+        factor = unitBits / type.bits;
+    } else {
+        factor = 1;
+    }
+    return true;
+}
+
+inline bool
+zttGroupSize(ExecContext *xc, const ZttTypeInfo &type, uint32_t &groupSize)
+{
+    const RegVal configuredUnitBits = xc->readMiscReg(MISCREG_AMEUDSZ);
+    if (configuredUnitBits == 0 || configuredUnitBits > UINT32_MAX) {
+        zttSetUnsupported(xc);
+        return false;
+    }
+    const uint32_t unitBits = static_cast<uint32_t>(configuredUnitBits);
+    if (type.bits > unitBits) {
+        if (type.bits % unitBits) {
+            zttSetUnsupported(xc);
+            return false;
+        }
+        groupSize = type.bits / unitBits;
+    } else {
+        groupSize = 1;
+    }
+    return true;
+}
+
+inline bool
+zttMSpan(uint32_t base, uint32_t squareCount, uint32_t packFactor,
+         uint32_t groupSize, uint32_t &span)
+{
+    if (!squareCount || !packFactor || squareCount % packFactor)
+        return false;
+    span = packFactor > 1 ? squareCount / packFactor :
+                            squareCount * groupSize;
+    return span && base % groupSize == 0 &&
+           base + span <= RiscvISA::NumZttMatRegs;
+}
+
+using ZttMRegArray = std::array<RiscvISA::MatRegContainer,
+                                RiscvISA::NumZttMatRegs>;
+
+inline uint64_t
+zttPhysicalMRegBits(ExecContext *xc, uint32_t len)
+{
+    return uint64_t(len) * len * xc->readMiscReg(MISCREG_AMEUDSZ);
+}
+
+inline void
+zttSnapshotMOperand(ExecContext *xc, uint32_t base, uint32_t span,
+                    const RiscvISA::MatRegContainer &baseReg,
+                    ZttMRegArray &snapshot)
+{
+    snapshot[0] = baseReg;
+    for (uint32_t i = 1; i < span; ++i) {
+        xc->tcBase()->getReg(
+            RiscvISA::matRegClass[RiscvISA::ZttMatRegBase + base + i],
+            &snapshot[i]);
+    }
+}
+
+inline void
+zttCommitMOperand(ExecContext *xc, uint32_t base, uint32_t span,
+                  const ZttMRegArray &result,
+                  RiscvISA::MatRegContainer &baseReg)
+{
+    baseReg = result[0];
+    for (uint32_t i = 1; i < span; ++i) {
+        xc->tcBase()->setReg(
+            RiscvISA::matRegClass[RiscvISA::ZttMatRegBase + base + i],
+            &result[i]);
+    }
+}
+
+template <size_t Count>
+inline unsigned __int128
+zttReadMOperandElement(
+    const std::array<RiscvISA::MatRegContainer, Count> &regs,
+    uint64_t physicalBits, const ZttTypeInfo &type, uint64_t element)
+{
+    unsigned __int128 value = 0;
+    const uint64_t operandBit = element * type.bits;
+    for (uint32_t bit = 0; bit < type.bits; ++bit) {
+        const uint64_t linearBit = operandBit + bit;
+        const uint64_t regIndex = linearBit / physicalBits;
+        const uint64_t localBit = linearBit % physicalBits;
+        auto reg = regs[regIndex];
+        auto bytes = reg.template as<uint8_t>();
+        const uint8_t byte = bytes[(localBit / 8) /
+                                   MaxMatRowLenInBytes]
+                                  [(localBit / 8) %
+                                   MaxMatRowLenInBytes];
+        value |= static_cast<unsigned __int128>(
+            (byte >> (localBit & 7)) & 1) << bit;
+    }
+    return value;
+}
+
+template <size_t Count>
+inline void
+zttWriteMOperandElement(
+    std::array<RiscvISA::MatRegContainer, Count> &regs,
+    uint64_t physicalBits, const ZttTypeInfo &type, uint64_t element,
+    unsigned __int128 value)
+{
+    const uint64_t operandBit = element * type.bits;
+    for (uint32_t bit = 0; bit < type.bits; ++bit) {
+        const uint64_t linearBit = operandBit + bit;
+        const uint64_t regIndex = linearBit / physicalBits;
+        const uint64_t localBit = linearBit % physicalBits;
+        auto bytes = regs[regIndex].template as<uint8_t>();
+        uint8_t &byte = bytes[(localBit / 8) / MaxMatRowLenInBytes]
+                             [(localBit / 8) % MaxMatRowLenInBytes];
+        const uint8_t mask = uint8_t(1) << (localBit & 7);
+        if ((value >> bit) & 1)
+            byte |= mask;
+        else
+            byte &= ~mask;
+    }
+}
+
+inline bool
+zttPackedTileFits(ExecContext *xc, const ZttTypeInfo &type, uint32_t len,
+                  uint32_t factor)
+{
+    const uint64_t tileBits = uint64_t(len) * len * type.bits * factor;
+    if (tileBits > RiscvISA::MatRegContainer::size() * 8) {
+        zttSetUnsupported(xc);
+        return false;
+    }
+    return true;
+}
+
+inline bool
+zttElementBitOffset(const ZttTypeInfo &type, uint32_t len, uint32_t row,
+                    uint32_t column, uint64_t &offset)
+{
+    if (row >= len || column >= len)
+        return false;
+    offset = (uint64_t(row) * len + column) * type.bits;
+    return offset + type.bits <= RiscvISA::MatRegContainer::size() * 8;
+}
+
+inline unsigned __int128
+zttReadTileElement(const RiscvISA::MatRegContainer &source,
+                   const ZttTypeInfo &type, uint32_t len, uint32_t row,
+                   uint32_t column)
+{
+    auto reg = source;
+    auto bytes = reg.as<uint8_t>();
+    uint64_t offset;
+    if (!zttElementBitOffset(type, len, row, column, offset))
+        return 0;
+    unsigned __int128 value = 0;
+    for (uint32_t bit = 0; bit < type.bits; ++bit) {
+        const uint64_t bitOffset = offset + bit;
+        const uint64_t byteOffset = bitOffset / 8;
+        const uint8_t byte = bytes[byteOffset / MaxMatRowLenInBytes]
+                                  [byteOffset % MaxMatRowLenInBytes];
+        value |= static_cast<unsigned __int128>(
+            (byte >> (bitOffset & 7)) & 1) << bit;
+    }
+    return value;
+}
+
+inline unsigned __int128
+zttReadTileSquareElement(const RiscvISA::MatRegContainer &source,
+                         const ZttTypeInfo &type, uint32_t len,
+                         uint32_t square, uint32_t row, uint32_t column)
+{
+    if (row >= len || column >= len)
+        return 0;
+    auto reg = source;
+    auto bytes = reg.as<uint8_t>();
+    const uint64_t offset =
+        (uint64_t(square) * len * len + uint64_t(row) * len + column) *
+        type.bits;
+    if (offset + type.bits > RiscvISA::MatRegContainer::size() * 8)
+        return 0;
+    unsigned __int128 value = 0;
+    for (uint32_t bit = 0; bit < type.bits; ++bit) {
+        const uint64_t bitOffset = offset + bit;
+        const uint64_t byteOffset = bitOffset / 8;
+        const uint8_t byte = bytes[byteOffset / MaxMatRowLenInBytes]
+                                  [byteOffset % MaxMatRowLenInBytes];
+        value |= static_cast<unsigned __int128>(
+            (byte >> (bitOffset & 7)) & 1) << bit;
+    }
+    return value;
+}
+
+inline void
+zttWriteTileElement(RiscvISA::MatRegContainer &reg,
+                    const ZttTypeInfo &type, uint32_t len, uint32_t row,
+                    uint32_t column, unsigned __int128 value)
+{
+    auto bytes = reg.as<uint8_t>();
+    uint64_t offset;
+    if (!zttElementBitOffset(type, len, row, column, offset))
+        return;
+    for (uint32_t bit = 0; bit < type.bits; ++bit) {
+        const uint64_t bitOffset = offset + bit;
+        const uint64_t byteOffset = bitOffset / 8;
+        uint8_t &byte = bytes[byteOffset / MaxMatRowLenInBytes]
+                             [byteOffset % MaxMatRowLenInBytes];
+        const uint8_t mask = uint8_t(1) << (bitOffset & 7);
+        if ((value >> bit) & 1)
+            byte |= mask;
+        else
+            byte &= ~mask;
+    }
+}
+
+inline void
+zttWriteTileSquareElement(RiscvISA::MatRegContainer &reg,
+                          const ZttTypeInfo &type, uint32_t len,
+                          uint32_t square, uint32_t row, uint32_t column,
+                          unsigned __int128 value)
+{
+    auto bytes = reg.as<uint8_t>();
+    const uint64_t offset =
+        (uint64_t(square) * len * len + uint64_t(row) * len + column) *
+        type.bits;
+    if (offset + type.bits > RiscvISA::MatRegContainer::size() * 8)
+        return;
+    for (uint32_t bit = 0; bit < type.bits; ++bit) {
+        const uint64_t bitOffset = offset + bit;
+        const uint64_t byteOffset = bitOffset / 8;
+        uint8_t &byte = bytes[byteOffset / MaxMatRowLenInBytes]
+                             [byteOffset % MaxMatRowLenInBytes];
+        const uint8_t mask = uint8_t(1) << (bitOffset & 7);
+        if ((value >> bit) & 1)
+            byte |= mask;
+        else
+            byte &= ~mask;
+    }
+}
+
+inline RiscvISA::MatRegContainer
+zttExtractMOperandSquare(const ZttMRegArray &regs, uint64_t physicalBits,
+                         const ZttTypeInfo &type, uint32_t len,
+                         uint32_t square)
+{
+    RiscvISA::MatRegContainer result;
+    result.zero();
+    for (uint32_t row = 0; row < len; ++row) {
+        for (uint32_t col = 0; col < len; ++col) {
+            const uint64_t element =
+                (uint64_t(square) * len + row) * len + col;
+            zttWriteTileElement(
+                result, type, len, row, col,
+                zttReadMOperandElement(regs, physicalBits, type, element));
+        }
+    }
+    return result;
+}
+
+inline void
+zttInsertMOperandSquare(ZttMRegArray &regs, uint64_t physicalBits,
+                        const ZttTypeInfo &type, uint32_t len,
+                        uint32_t square,
+                        const RiscvISA::MatRegContainer &source)
+{
+    for (uint32_t row = 0; row < len; ++row) {
+        for (uint32_t col = 0; col < len; ++col) {
+            const uint64_t element =
+                (uint64_t(square) * len + row) * len + col;
+            zttWriteMOperandElement(
+                regs, physicalBits, type, element,
+                zttReadTileElement(source, type, len, row, col));
+        }
+    }
+}
+
+inline __int128
+zttSignedValue(unsigned __int128 raw, uint32_t bits)
+{
+    raw &= zttBitMask128(bits);
+    if (bits == 128)
+        return static_cast<__int128>(raw);
+    const unsigned __int128 sign =
+        static_cast<unsigned __int128>(1) << (bits - 1);
+    if (raw & sign)
+        return static_cast<__int128>(
+            raw - (static_cast<unsigned __int128>(1) << bits));
+    return static_cast<__int128>(raw);
+}
+
+inline long double
+zttFloatValue(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    if (zttFloatIsNaN(raw, type))
+        return std::numeric_limits<long double>::quiet_NaN();
+    const uint32_t fractionBits = type.bits - type.expWidth - 1;
+    const uint64_t value = static_cast<uint64_t>(raw);
+    const uint64_t fractionMask = zttBitMask(fractionBits);
+    const uint64_t exponentMask = zttBitMask(type.expWidth);
+    const uint64_t fraction = value & fractionMask;
+    const uint64_t exponent = (value >> fractionBits) & exponentMask;
+    const bool negative = (value >> (type.bits - 1)) & 1;
+    const int bias = (1 << (type.expWidth - 1)) - 1;
+    long double result;
+    if (exponent == 0) {
+        if (!type.hasDenormals)
+            return negative ? -0.0L : 0.0L;
+        result = std::ldexp(static_cast<long double>(fraction),
+                            1 - bias - fractionBits);
+    } else if (type.hasInfinity && exponent == exponentMask) {
+        if (fraction)
+            return std::numeric_limits<long double>::quiet_NaN();
+        return negative ? -std::numeric_limits<long double>::infinity() :
+                          std::numeric_limits<long double>::infinity();
+    } else {
+        result = std::ldexp(1.0L +
+                            std::ldexp(static_cast<long double>(fraction),
+                                       -int(fractionBits)),
+                            int(exponent) - bias);
+    }
+    return negative ? -result : result;
+}
+
+inline bool
+zttRoundIncrement(long double fractional, uint64_t integral, bool negative,
+                  ZttRoundingMode mode)
+{
+    switch (mode) {
+    case ZttRoundingMode::Rne:
+        return fractional > 0.5L ||
+               (fractional == 0.5L && (integral & 1));
+    case ZttRoundingMode::Rtz:
+        return false;
+    case ZttRoundingMode::Rdn:
+        return negative && fractional != 0.0L;
+    case ZttRoundingMode::Rup:
+        return !negative && fractional != 0.0L;
+    case ZttRoundingMode::Rmm:
+        return fractional >= 0.5L;
+    case ZttRoundingMode::Rno:
+        return fractional != 0.0L && !(integral & 1);
+    }
+    return false;
+}
+
+inline unsigned __int128
+zttFloatMaxFiniteBits(const ZttTypeInfo &type, bool negative)
+{
+    const uint32_t fractionBits = type.bits - type.expWidth - 1;
+    const uint64_t exponentMask = zttBitMask(type.expWidth);
+    const bool ocpE4M3 = type.kind == ZttElemType::Fp8E4M3;
+    // OCP E4M3FN uses exponent=all-ones with fraction=all-ones for NaN;
+    // fractions below that value remain finite, so its max finite encoding is
+    // 0x7e/0xfe rather than the IEEE exponent-minus-one encoding.
+    const uint64_t exponent = ocpE4M3 ? exponentMask :
+        (type.hasInfinity ? exponentMask - 1 : exponentMask);
+    const uint64_t fraction = ocpE4M3 ? zttBitMask(fractionBits) - 1 :
+                                        zttBitMask(fractionBits);
+    uint64_t value = (exponent << fractionBits) | fraction;
+    if (negative)
+        value |= uint64_t(1) << (type.bits - 1);
+    return value;
+}
+
+inline unsigned __int128
+zttFloatOverflowBits(const ZttTypeInfo &type, bool negative)
+{
+    const bool toInfinity = type.hasInfinity &&
+        (type.rounding == ZttRoundingMode::Rne ||
+         type.rounding == ZttRoundingMode::Rmm ||
+         (type.rounding == ZttRoundingMode::Rup && !negative) ||
+         (type.rounding == ZttRoundingMode::Rdn && negative));
+    if (!toInfinity)
+        return zttFloatMaxFiniteBits(type, negative);
+    const uint32_t fractionBits = type.bits - type.expWidth - 1;
+    uint64_t value = zttBitMask(type.expWidth) << fractionBits;
+    if (negative)
+        value |= uint64_t(1) << (type.bits - 1);
+    return value;
+}
+
+inline unsigned __int128
+zttRoundFloat(long double input, const ZttTypeInfo &type,
+              ZttFpEnv *fpEnv = nullptr)
+{
+    const uint32_t fractionBits = type.bits - type.expWidth - 1;
+    const uint64_t fractionLimit = uint64_t(1) << fractionBits;
+    const uint64_t exponentMask = zttBitMask(type.expWidth);
+    const int bias = (1 << (type.expWidth - 1)) - 1;
+    const bool negative = std::signbit(input);
+    const uint64_t sign = negative ? uint64_t(1) << (type.bits - 1) : 0;
+    const bool ocpE4M3 = type.kind == ZttElemType::Fp8E4M3;
+    const int maxFiniteExponent = ocpE4M3 ? int(exponentMask) :
+                                             int(exponentMask) - 1;
+
+    if (std::isnan(input)) {
+        // Every accepted standard floating format has a canonical NaN
+        // encoding.  In particular, OCP E4M3 has no infinities but reserves
+        // the all-ones exponent/fraction code for NaN.
+        return zttFloatCanonicalNaN(type);
+    }
+    if (std::isinf(input)) {
+        if (!type.hasInfinity && fpEnv)
+            zttAccrueFpFlags(*fpEnv, ZttFpFlagOF | ZttFpFlagNX);
+        return type.hasInfinity ? sign | (exponentMask << fractionBits) :
+                                  zttFloatMaxFiniteBits(type, negative);
+    }
+
+    const long double magnitude = std::fabs(input);
+    if (magnitude == 0.0L)
+        return sign;
+
+    int binaryExponent;
+    const long double significand = std::frexp(magnitude, &binaryExponent);
+    int exponent = binaryExponent - 1;
+    if (exponent + bias > maxFiniteExponent) {
+        if (fpEnv)
+            zttAccrueFpFlags(*fpEnv, ZttFpFlagOF | ZttFpFlagNX);
+        return zttFloatOverflowBits(type, negative);
+    }
+
+    if (exponent + bias <= 0) {
+        if (!type.hasDenormals) {
+            if (fpEnv)
+                zttAccrueFpFlags(*fpEnv, ZttFpFlagUF | ZttFpFlagNX);
+            return sign;
+        }
+        const long double scaled = std::ldexp(magnitude,
+                                               fractionBits + bias - 1);
+        uint64_t fraction = static_cast<uint64_t>(std::floor(scaled));
+        const long double discarded = scaled - fraction;
+        if (zttRoundIncrement(discarded, fraction, negative,
+                              type.rounding))
+            ++fraction;
+        if (discarded != 0.0L && fpEnv)
+            zttAccrueFpFlags(
+                *fpEnv, ZttFpFlagNX |
+                    (fraction < fractionLimit ? ZttFpFlagUF : 0));
+        if (fraction == 0)
+            return sign;
+        if (fraction >= fractionLimit)
+            return sign | fractionLimit;
+        return sign | fraction;
+    }
+
+    const long double scaled = std::ldexp(significand * 2.0L - 1.0L,
+                                           fractionBits);
+    uint64_t fraction = static_cast<uint64_t>(std::floor(scaled));
+    const long double discarded = scaled - fraction;
+    if (zttRoundIncrement(discarded, fraction, negative,
+                          type.rounding))
+        ++fraction;
+    if (discarded != 0.0L && fpEnv)
+        zttAccrueFpFlags(*fpEnv, ZttFpFlagNX);
+    if (fraction == fractionLimit) {
+        fraction = 0;
+        ++exponent;
+        if (exponent + bias > maxFiniteExponent) {
+            if (fpEnv)
+                zttAccrueFpFlags(*fpEnv, ZttFpFlagOF | ZttFpFlagNX);
+            return zttFloatOverflowBits(type, negative);
+        }
+    }
+    return sign | (uint64_t(exponent + bias) << fractionBits) | fraction;
+}
+
+} // anonymous namespace
+}};
+
+def template ZttResourceExecute {{
+    Fault
+    %(class_name)s::execute(ExecContext *xc,
+        trace::InstRecord *traceData) const
+    {
+        Fault zttAccessFault = checkAccess(xc, false);
+        if (zttAccessFault != NoFault)
+            return zttAccessFault;
+        %(op_decl)s;
+        /* %(operands)s */
+        %(op_rd)s;
+        %(code)s;
+        %(op_wb)s;
+        return NoFault;
+    }
+}};
+
+def template ZttConfDeclare {{
+    class %(class_name)s : public %(base_class)s
+    {
+      private:
+        %(reg_idx_arr_decl)s;
+
+      public:
+        %(class_name)s(ExtMachInst machInst);
+        Fault execute(ExecContext *, trace::InstRecord *) const override;
+        using %(base_class)s::generateDisassembly;
+    };
+}};
+
+def template ZttConfConstructor {{
+    %(class_name)s::%(class_name)s(ExtMachInst machInst)
+        : %(base_class)s("%(mnemonic)s", machInst, %(op_class)s)
+    {
+        %(set_reg_idx_arr)s;
+        %(constructor)s;
+    }
+}};
+
+def template ZttConfDecode {{
+    return new %(class_name)s(machInst);
+}};
+
+def template ZttConfExecute {{
+    Fault
+    %(class_name)s::execute(ExecContext *xc,
+        trace::InstRecord *traceData) const
+    {
+        Fault zttAccessFault = checkAccess(xc);
+        if (zttAccessFault != NoFault)
+            return zttAccessFault;
+        %(op_decl)s;
+        /* %(operands)s */
+        %(op_rd)s;
+        %(ztt_aliases)s
+        %(code)s;
+        %(op_wb)s;
+        markDirty(xc);
+        return NoFault;
+    }
+}};
+
+def template ZttConfReadExecute {{
+    Fault
+    %(class_name)s::execute(ExecContext *xc,
+        trace::InstRecord *traceData) const
+    {
+        Fault zttAccessFault = checkAccess(xc);
+        if (zttAccessFault != NoFault)
+            return zttAccessFault;
+        %(op_decl)s;
+        /* %(operands)s */
+        %(op_rd)s;
+        %(ztt_aliases)s
+        %(code)s;
+        %(op_wb)s;
+        return NoFault;
+    }
+}};
+
+def format ZttMsettypOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttConfStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttMdReg = zttDestReg; '
+                         'ZttMdData = zttDestType; ZttXs1;'},
+                        flags + ('IsSerializeBefore', 'IsSerializeAfter'))
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttMdReg;
+        [[maybe_unused]] const uint32_t zttDest =
+            RiscvISA::ZttMatRegBase + ZTT_MD;
+        RegVal &zttDestType = ZttMdData;
+        const RegVal zttType = ZttXs1;
+    '''
+    header_output = ZttConfDeclare.subst(iop)
+    decoder_output = ZttConfConstructor.subst(iop)
+    decode_block = ZttConfDecode.subst(iop)
+    exec_output = ZttConfExecute.subst(iop)
+}};
+
+def format ZttAsettypOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttConfStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttAdReg = zttDestReg; '
+                         'ZttAdData = zttDestType; ZttXs1;'},
+                        flags)
+    iop.ztt_aliases = '''
+        auto &zttDestReg = ZttAdReg;
+        [[maybe_unused]] const uint32_t zttDest =
+            RiscvISA::ZttAccRegBase + ZTT_AD;
+        RegVal &zttDestType = ZttAdData;
+        const RegVal zttType = ZttXs1;
+    '''
+    header_output = ZttConfDeclare.subst(iop)
+    decoder_output = ZttConfConstructor.subst(iop)
+    decode_block = ZttConfDecode.subst(iop)
+    exec_output = ZttConfExecute.subst(iop)
+}};
+
+def format ZttMgettypOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttConfStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttXd = zttResult; ZttMs1; ZttMs1Data;'}, flags)
+    iop.ztt_aliases = '''
+        RegVal &zttResult = ZttXd;
+        [[maybe_unused]] const uint32_t zttSrc = ZttMs1;
+        const RegVal zttSrcType = ZttMs1Data;
+    '''
+    header_output = ZttConfDeclare.subst(iop)
+    decoder_output = ZttConfConstructor.subst(iop)
+    decode_block = ZttConfDecode.subst(iop)
+    exec_output = ZttConfReadExecute.subst(iop)
+}};
+
+def format ZttAgettypOp(code, *flags) {{
+    iop = InstObjParams(name, Name, 'ZttConfStaticInst',
+                        {'code': code,
+                         'operands':
+                         'ZttXd = zttResult; ZttAgetAd; ZttAgetData;'}, flags)
+    iop.ztt_aliases = '''
+        RegVal &zttResult = ZttXd;
+        [[maybe_unused]] const uint32_t zttSrc = ZttAgetAd;
+        const RegVal zttSrcType = ZttAgetData;
+    '''
+    header_output = ZttConfDeclare.subst(iop)
+    decoder_output = ZttConfConstructor.subst(iop)
+    decode_block = ZttConfDecode.subst(iop)
+    exec_output = ZttConfReadExecute.subst(iop)
+}};
+
+def format ZttAcquireOp(*flags) {{
+    code = '''
+        const RegVal descriptor = ZttXs1;
+        auto *isa = static_cast<RiscvISA::ISA *>(
+            xc->tcBase()->getIsaPtr());
+        const uint32_t waitMode = descriptor & 0x3;
+        const uint32_t timeoutClass = (descriptor >> 2) & 0xf;
+        const bool badDescriptor = (descriptor >> 6) || waitMode > 1 ||
+            (waitMode == 1 && timeoutClass > 3 && timeoutClass != 0xf);
+
+        if (badDescriptor) {
+            ZttXd = RiscvISA::encodeAMEAcquireStatus(
+                RiscvISA::AMEAcquireStatus::BAD_DESC);
+        } else if (isa->readMiscRegNoEffect(MISCREG_AMEOWN) & 1) {
+            // Re-acquiring by the owner is idempotent and always reports
+            // GRANTED, independent of the current backend availability.
+            ZttXd = RiscvISA::encodeAMEAcquireStatus(
+                RiscvISA::AMEAcquireStatus::GRANTED);
+        } else {
+            const RegVal backendResult =
+                isa->ameAcquireResult(waitMode, timeoutClass);
+            if (!(backendResult & 1)) {
+                // Backend failures do not change ownership or AME state.
+                ZttXd = backendResult;
+            } else {
+                RiscvISA::MatRegContainer zero;
+                zero.zero();
+                for (RegIndex idx = 0; idx < RiscvISA::NumMatRegs; ++idx)
+                    xc->tcBase()->setReg(
+                        RiscvISA::matRegClass[idx], &zero);
+                xc->setMiscReg(MISCREG_AMESTYPE, 0);
+                xc->setMiscReg(MISCREG_AMEFFLAGS, 0);
+                xc->setMiscReg(MISCREG_AMEXSAT, 0);
+                xc->setMiscReg(MISCREG_AMESTATUS, 0);
+                isa->setMiscRegNoEffect(MISCREG_AMEOWN, 1);
+
+                STATUS status = xc->readMiscReg(MISCREG_STATUS);
+                status.ms = RiscvISA::AMEStatus::INITIAL;
+                xc->setMiscReg(MISCREG_STATUS, status);
+                const MISA misa = xc->readMiscReg(MISCREG_ISA);
+                if (misa.rvh && RiscvISA::virtualizationEnabled(xc)) {
+                    STATUS vsstatus = xc->readMiscReg(MISCREG_VSSTATUS);
+                    vsstatus.ms = RiscvISA::AMEStatus::INITIAL;
+                    xc->setMiscReg(MISCREG_VSSTATUS, vsstatus);
+                }
+                ZttXd = backendResult;
+            }
+        }
+    '''
+    iop = InstObjParams(name, Name, 'ZttConfStaticInst',
+                        {'code': code, 'operands': 'ZttXd; ZttXs1;'},
+                        flags + ('IsSerializeBefore', 'IsSerializeAfter'))
+    header_output = ZttConfDeclare.subst(iop)
+    decoder_output = ZttConfConstructor.subst(iop)
+    decode_block = ZttConfDecode.subst(iop)
+    exec_output = ZttResourceExecute.subst(iop)
+}};
+
+def format ZttReleaseOp(*flags) {{
+    code = '''
+        auto *isa = static_cast<RiscvISA::ISA *>(
+            xc->tcBase()->getIsaPtr());
+        if (isa->readMiscRegNoEffect(MISCREG_AMEOWN) & 1) {
+            isa->setMiscRegNoEffect(MISCREG_AMEOWN, 0);
+            STATUS status = xc->readMiscReg(MISCREG_STATUS);
+            status.ms = RiscvISA::AMEStatus::INITIAL;
+            xc->setMiscReg(MISCREG_STATUS, status);
+            MISA misa = xc->readMiscReg(MISCREG_ISA);
+            if (misa.rvh && RiscvISA::virtualizationEnabled(xc)) {
+                STATUS vsstatus = xc->readMiscReg(MISCREG_VSSTATUS);
+                vsstatus.ms = RiscvISA::AMEStatus::INITIAL;
+                xc->setMiscReg(MISCREG_VSSTATUS, vsstatus);
+            }
+        }
+    '''
+    iop = InstObjParams(name, Name, 'ZttConfStaticInst',
+                        {'code': code, 'operands': ''},
+                        flags + ('IsSerializeBefore', 'IsSerializeAfter'))
+    header_output = ZttConfDeclare.subst(iop)
+    decoder_output = ZttConfConstructor.subst(iop)
+    decode_block = ZttConfDecode.subst(iop)
+    exec_output = ZttResourceExecute.subst(iop)
+}};

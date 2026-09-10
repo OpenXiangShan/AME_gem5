@@ -155,6 +155,10 @@ int_fast32_t f16_to_i32_r_minMag( float16_t, bool );
 int_fast64_t f16_to_i64_r_minMag( float16_t, bool );
 float32_t f16_to_f32( float16_t );
 float64_t f16_to_f64( float16_t );
+bfloat16_t f16_to_bf16( float16_t );
+float16_t bf16_to_f16( bfloat16_t );
+float32_t bf16_to_f32( bfloat16_t );
+bfloat16_t f32_to_bf16( float32_t );
 #ifdef SOFTFLOAT_FAST_INT64
 extFloat80_t f16_to_extF80( float16_t );
 float128_t f16_to_f128( float16_t );
@@ -399,4 +403,3 @@ bool f128M_isSignalingNaN( const float128_t * );
 #endif
 
 #endif
-

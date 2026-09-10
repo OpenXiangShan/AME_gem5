@@ -3,6 +3,7 @@
 // Copyright (c) 2015 RISC-V Foundation
 // Copyright (c) 2016-2017 The University of Virginia
 // Copyright (c) 2020 Barkhausen Institut
+// Copyright (c) 2026 BOSC & ICT, CAS
 // All rights reserved.
 //
 // Redistribution and use in source and binary forms, with or without
@@ -42,6 +43,11 @@
 ##include "vector_mem.isa"
 ##include "zcmp.isa"
 ##include "zcmt.isa"
+
+##include "ztt_conf.isa"
+##include "ztt_mem.isa"
+##include "ztt_arith.isa"
+##include "ztt_mv.isa"
 
 // Include formats for nonstandard extensions
 ##include "compressed.isa"
