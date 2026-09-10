@@ -1,4 +1,6 @@
-# Version 25.0.0.1
+# Version 25.1.1.0-dev
+
+The notes below are inherited from upstream gem5 25.0.0.1.
 
 **[HOTFIX]** This is a hotfix release incorporating the following critical fixes highlighted below. This release addresses urgent issues that required immediate attention outside the regular release schedule.
 
