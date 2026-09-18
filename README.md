@@ -38,7 +38,7 @@ In the AME_gem5 root directory:
 scons build/RISCV/gem5.opt -j$(nproc)
 ```
 
-Then, install the packaged AME LLVM and GNU RISC-V toolchain:
+Then, install the toolchain:
 
 ```sh
 ./scripts/build_toolchain.sh
