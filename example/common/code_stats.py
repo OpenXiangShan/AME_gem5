@@ -34,7 +34,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-
 CATEGORIES = {
     "C/C++": {".c", ".cc", ".cpp", ".h", ".hh", ".hpp"},
     "Assembly": {".s", ".S"},
@@ -48,26 +47,38 @@ def main() -> None:
     root = Path(sys.argv[1]).resolve()
     totals = {category: [0, 0, 0] for category in CATEGORIES}
     for path in root.rglob("*"):
-        if not path.is_file() or "build" in path.parts or "__pycache__" in path.parts:
+        if (
+            not path.is_file()
+            or "build" in path.parts
+            or "__pycache__" in path.parts
+        ):
             continue
         category = next(
             (
                 name
                 for name, suffixes in CATEGORIES.items()
                 if path.suffix in suffixes
-                and (name != "Make" or path.name == "Makefile" or path.suffix == ".mk")
+                and (
+                    name != "Make"
+                    or path.name == "Makefile"
+                    or path.suffix == ".mk"
+                )
             ),
             None,
         )
         if category is None:
             continue
         content = path.read_text(encoding="utf-8", errors="replace")
-        lines = content.count("\n") + bool(content and not content.endswith("\n"))
+        lines = content.count("\n") + bool(
+            content and not content.endswith("\n")
+        )
         totals[category][0] += 1
         totals[category][1] += int(lines)
         totals[category][2] += path.stat().st_size
 
-    total = tuple(sum(values[index] for values in totals.values()) for index in range(3))
+    total = tuple(
+        sum(values[index] for values in totals.values()) for index in range(3)
+    )
     print("\nCode statistics (build output excluded):")
     print("  category        files   lines   bytes")
     for category, (files, lines, byte_count) in totals.items():

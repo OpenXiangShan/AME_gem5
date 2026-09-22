@@ -33,9 +33,10 @@ from common import (
 )
 from common.Benchmarks import *
 from common.FSConfig import *
-from example.gpufs.Disjoint_VIPER import *
 from ruby import Ruby
 from system.amdgpu import *
+
+from example.gpufs.Disjoint_VIPER import *
 
 from m5.util import panic
 

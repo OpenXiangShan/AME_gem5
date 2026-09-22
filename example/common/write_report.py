@@ -50,7 +50,7 @@ def parse_blocks(path: Path) -> list[tuple[int, str, str]]:
         else:
             end = len(text)
         blocks.append(
-            (int(match.group(1)), match.group(2), text[match.start():end])
+            (int(match.group(1)), match.group(2), text[match.start() : end])
         )
     return blocks
 

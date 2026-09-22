@@ -162,11 +162,13 @@ def write_header_file(sim_object: Type, param_hh: str):
             for ns in reversed(self.namespaces):
                 code("} // namespace $ns")
 
-    code("""\
+    code(
+        """\
     #ifndef __PARAMS__${sim_object}__
     #define __PARAMS__${sim_object}__
 
-    """)
+    """
+    )
 
     # The base SimObject has a couple of params that get
     # automatically set from Python without being declared through
@@ -214,11 +216,13 @@ def write_header_file(sim_object: Type, param_hh: str):
 
     code.indent()
     if sim_object == SimObject:
-        code("""
+        code(
+            """
     virtual ~SimObjectParams() = default;
 
     std::string name;
-        """)
+        """
+        )
 
     for param in params:
         param.cxx_decl(code)

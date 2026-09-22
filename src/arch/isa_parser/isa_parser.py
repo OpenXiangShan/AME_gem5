@@ -123,7 +123,9 @@ class Template:
             # The reinterpret casts are largely because an array with a known
             # size cannot be passed as an argument which is an array with an
             # unknown size in C++.
-            myDict["set_reg_idx_arr"] = """
+            myDict[
+                "set_reg_idx_arr"
+            ] = """
     setRegIdxArrays(
         reinterpret_cast<RegIdArrayPtr>(
             &std::remove_pointer_t<decltype(this)>::srcRegIdxArr),
@@ -1266,7 +1268,8 @@ StaticInstPtr
 %(isa_name)s::%(decoder_name)s::decodeInst(%(isa_name)s::ExtMachInst machInst)
 {
     using namespace %(namespace)s;
-""" % self,
+"""
+            % self,
             "}",
         )
 
