@@ -59,7 +59,6 @@ from m5.objects import (
 from m5.objects.BaseMinorCPU import makeMinorDefaultFUPool
 from m5.objects.RiscvCPU import RiscvMinorCPU
 
-
 parser = argparse.ArgumentParser()
 parser.add_argument(
     "--cmd",

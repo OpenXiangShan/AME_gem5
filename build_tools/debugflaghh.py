@@ -79,16 +79,19 @@ def write_header_file(
     """
     code = code_formatter()
 
-    code(f"""
+    code(
+        f"""
 #ifndef __DEBUG_{name}_HH__
 #define __DEBUG_{name}_HH__
 
 #include "base/compiler.hh" // For namespace deprecation
 #include "base/debug.hh"
-""")
+"""
+    )
     for flag in components:
         code(f'#include "debug/{flag}.hh"')
-    code("""
+    code(
+        """
 namespace gem5
 {
 
@@ -97,14 +100,16 @@ namespace debug
 
 namespace unions
 {
-""")
+"""
+    )
 
     # Use unions to prevent debug flags from being destructed. It's the
     # responsibility of the programmer to handle object destruction for members
     # of the union. We purposefully leave that destructor empty so that we can
     # use debug flags even in the destructors of other objects.
     if components:
-        code("""
+        code(
+            """
 inline union ${{name}}
 {
     ~${{name}}() {}
@@ -118,9 +123,11 @@ inline union ${{name}}
         }) {}
 
 } instance${{name}};
-""")
+"""
+        )
     else:
-        code("""
+        code(
+            """
 inline union ${{name}}
 {
     ~${{name}}() {}
@@ -129,9 +136,11 @@ inline union ${{name}}
     ${{name}}() : flag${{name}}("${{name}}", "${{desc}}", ${{"true" if fmt else "false"}}) {}
 
 } instance${{name}};
-""")
+"""
+        )
 
-    code("""
+    code(
+        """
 } // namespace unions
 
 inline constexpr const auto& ${{name}} =
@@ -141,7 +150,8 @@ inline constexpr const auto& ${{name}} =
 } // namespace gem5
 
 #endif // __DEBUG_${{name}}_HH__
-""")
+"""
+    )
 
     code.write(hh)
 

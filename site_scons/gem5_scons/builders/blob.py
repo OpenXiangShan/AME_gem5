@@ -60,7 +60,8 @@ def build_blob(target, source, env):
     cc, hh = target
 
     hh_code = code_formatter()
-    hh_code("""\
+    hh_code(
+        """\
 #include <cstddef>
 #include <cstdint>
 
@@ -74,13 +75,15 @@ extern const std::uint8_t ${symbol}[];
 
 } // namespace Blobs
 } // namespace gem5
-""")
+"""
+    )
     hh_code.write(str(hh))
 
     include_path = os.path.relpath(hh.abspath, env["BUILDDIR"])
 
     cc_code = code_formatter()
-    cc_code("""\
+    cc_code(
+        """\
 #include "${include_path}"
 
 namespace gem5
@@ -89,12 +92,15 @@ namespace Blobs
 {
 
 const std::size_t ${symbol}_len = ${{len(data)}};
-""")
+"""
+    )
     bytesToCppArray(cc_code, symbol, data)
-    cc_code("""
+    cc_code(
+        """
 } // namespace Blobs
 } // namespace gem5
-""")
+"""
+    )
     cc_code.write(str(cc))
 
 
