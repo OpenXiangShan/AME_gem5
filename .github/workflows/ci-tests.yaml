@@ -202,6 +202,11 @@ jobs:
                     grpc \
                     boost
 
+            - name: Configure Boost include path
+              run: |
+                  BOOST_INCLUDE="$(brew --prefix boost)/include"
+                  test -f "$BOOST_INCLUDE/boost/multiprecision/cpp_int.hpp"
+                  echo "CPATH=$BOOST_INCLUDE${CPATH:+:$CPATH}" >> "$GITHUB_ENV"
 
             - name: Restore macOS build/ALL cache
               uses: actions/cache/restore@v6
