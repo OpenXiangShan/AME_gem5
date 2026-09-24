@@ -430,9 +430,45 @@ def zttStridedLoadInitiateBehaviour(transposed):
         return initiateMemRead(xc, zttBase, memSize, 0, byteEnable);
     '''
 
-def zttStridedStoreBehaviour(transposed):
-    return zttStridedGeometry(transposed) + '''
-        std::vector<uint8_t> data(segmentCount * segmentBytes, 0);
+def zttStridedStoreBehaviour(transposed, timing):
+    timing_guard = '''
+        const uint64_t zttMaxAddress =
+            static_cast<RiscvISA::ISA *>(
+                xc->tcBase()->getIsaPtr())->rvType() == RiscvISA::RV32 ?
+                UINT32_MAX : UINT64_MAX;
+        const unsigned __int128 zttAggregateExtent =
+            fullLastOffset + segmentBytes - 1;
+        if (!zttAggregateFits ||
+            zttAggregateExtent > zttMaxAddress ||
+            zttBase > zttMaxAddress -
+                static_cast<uint64_t>(zttAggregateExtent))
+            return std::make_shared<AddressFault>(
+                zttBase, STORE_ACCESS);
+    ''' if timing else ''
+    timing_store = '''
+        std::vector<bool> byteEnable(memSize, false);
+        for (uint64_t segment = 0; segment < segmentCount; ++segment)
+            for (uint64_t byte = 0; byte < segmentBytes; ++byte)
+                byteEnable[segment * zttStride + byte] = true;
+        return xc->writeMem(data.data(), memSize, zttBase, 0, nullptr,
+                            byteEnable);
+    ''' if timing else ''
+    atomic_store = '''
+        const std::vector<bool> segmentEnable(segmentBytes, true);
+        for (uint64_t segment = 0; segment < segmentCount; ++segment) {
+            Fault fault = xc->writeMem(
+                data.data() + segment * segmentBytes, segmentBytes,
+                zttSegmentAddress(segment), 0, nullptr, segmentEnable);
+            if (fault != NoFault)
+                return fault;
+        }
+        return NoFault;
+    '''
+    return zttStridedGeometry(transposed) + timing_guard + '''
+        const uint64_t zttDataSegmentStride = %s;
+        const uint64_t zttDataSize = %s ? memSize :
+            segmentCount * segmentBytes;
+        std::vector<uint8_t> data(zttDataSize, 0);
         std::array<RiscvISA::MatRegContainer,
                    RiscvISA::NumZttMatRegs> sources{};
         sources[0] = zttSrcReg;
@@ -447,7 +483,7 @@ def zttStridedStoreBehaviour(transposed):
             std::vector<uint8_t> stagedSegment(segmentBytes, 0);
             if (zttTransposed) {
                 const uint32_t square = segment / len;
-                const uint32_t col = segment % len;
+                const uint32_t col = segment %% len;
                 for (uint32_t row = 0; row < len; ++row) {
                     const uint64_t element =
                         (uint64_t(square) * len + row) * len + col;
@@ -476,21 +512,17 @@ def zttStridedStoreBehaviour(transposed):
                     }
                 }
             }
-            const uint64_t segmentBase = uint64_t(segment) * segmentBytes;
+            const uint64_t segmentBase =
+                uint64_t(segment) * zttDataSegmentStride;
             for (uint64_t byte = 0; byte < segmentBytes; ++byte) {
                 data[segmentBase + byte] = stagedSegment[byte];
             }
         }
-        const std::vector<bool> segmentEnable(segmentBytes, true);
-        for (uint64_t segment = 0; segment < segmentCount; ++segment) {
-            Fault fault = xc->writeMem(
-                data.data() + segment * segmentBytes, segmentBytes,
-                zttSegmentAddress(segment), 0, nullptr, segmentEnable);
-            if (fault != NoFault)
-                return fault;
-        }
-        return NoFault;
-    '''
+        %s
+    ''' % (
+        'zttStride' if timing else 'segmentBytes',
+        'true' if timing else 'false',
+        timing_store if timing else atomic_store)
 
 def zttWholeLoadBehaviour(timing):
     memory = '''
@@ -698,9 +730,11 @@ def format ZttStridedLoadOp(transposed, *flags) {{
 }};
 
 def format ZttStridedStoreOp(transposed, *flags) {{
-    code = zttStridedStoreBehaviour(transposed)
+    code = zttStridedStoreBehaviour(transposed, False)
     iop = InstObjParams(name, Name, 'ZttMemStaticInst',
-                        {'code': code, 'initiate_code': code,
+                         {'code': code,
+                         'initiate_code': zttStridedStoreBehaviour(
+                             transposed, True),
                          'initiate_operands':
                          'ZttXs1; ZttXs2; '
                          'ZttStoreMs1Reg; ZttStoreMs1Data;',
