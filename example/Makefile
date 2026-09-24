@@ -29,7 +29,10 @@
 SHELL := /bin/bash
 .SHELLFLAGS := -eu -o pipefail -c
 
-CASES := gemm_fp32
+CASES := \
+	gemm_fp32 \
+	gemm_int8 \
+	gemm_mixed
 
 BUILD_DIR := $(CURDIR)/build
 SUITE_REPORT := $(BUILD_DIR)/reports/EXAMPLE_REPORT.md
@@ -42,7 +45,7 @@ SUITE_REPORT := $(BUILD_DIR)/reports/EXAMPLE_REPORT.md
 help:
 	@echo "AME_gem5 Ztt v0.6 examples"
 	@echo
-	@echo "  make gemm_fp32   Test one case with reference (fallback: Host C)"
+	@echo "  make gemm_fp32   Build and test one case on Host and MinorCPU"
 	@echo "  make -C gemm_fp32 test-host-golden  Use configured matrices + Host C golden"
 	@echo "  make -C gemm_fp32 test-reference    Use configured matrices + reference"
 	@echo "  make test        Build and test all cases"
