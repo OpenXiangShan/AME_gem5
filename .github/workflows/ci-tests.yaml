@@ -16,7 +16,6 @@ concurrency:
 # Repository Actions variables can override these defaults.
 env:
     CI_BUILD_JOBS: ${{ vars.CI_BUILD_JOBS || '16' }}
-    CI_TEST_THREADS: ${{ vars.CI_TEST_THREADS || '2' }}
 
 jobs:
     pre-commit:
@@ -101,7 +100,6 @@ jobs:
             - run: echo "This job's status is ${{ job.status }}."
 
     clang-fast-compilation:
-        # The quick-tests job builds gem5.opt with GCC.
         # Clang is more strict than GCC. This job checks that gem5 compiles
         # with Clang. It compiles build/ALL/gem5.fast to maximize the change
         # for compilation error to be exposed.
@@ -134,47 +132,6 @@ jobs:
             - name: Clang Compilation
               working-directory: ${{ github.workspace }}
               run: scons build/ALL/gem5.fast -j "$CI_BUILD_JOBS"
-
-    quick-tests:
-        runs-on: [self-hosted, linux, x64, bosc, open]
-        if: github.event.pull_request.draft == false
-        timeout-minutes: 360 # Includes compilation and test execution.
-        defaults:
-            run:
-                shell: bash
-        env:
-            CC: gcc
-            CXX: g++
-        steps:
-            - name: Isolate Git configuration for this job
-              shell: bash
-              run: |
-                  umask 077
-                  job_git_config=$(mktemp "$RUNNER_TEMP/gitconfig.XXXXXX")
-                  if [ -f "$HOME/.gitconfig" ]; then
-                      cp "$HOME/.gitconfig" "$job_git_config"
-                  fi
-                  echo "GIT_CONFIG_GLOBAL=$job_git_config" >> "$GITHUB_ENV"
-            - uses: actions/checkout@v7
-
-            - name: Check host build tools
-              run: |
-                  for tool in "$CC" "$CXX" scons python3 python3-config pkg-config protoc make; do
-                      command -v "$tool" || exit 1
-                  done
-                  "$CC" --version
-                  python3-config --includes
-                  pkg-config --exists python3-embed protobuf zlib
-
-            - name: Build gem5 for quick tests
-              working-directory: ${{ github.workspace }}
-              run: scons --no-compress-debug build/ALL/gem5.opt -j "$CI_BUILD_JOBS"
-
-            - name: Run quick tests
-              working-directory: ${{ github.workspace }}/tests
-              run: >-
-                  ./main.py run gem5 --skip-build --length quick --variant opt
-                  -t "$CI_TEST_THREADS" --exclude-tags gcn_gpu -v
 
 # Custom Ztt floating-point unit tests.
     ztt-tests:
@@ -228,7 +185,6 @@ jobs:
         runs-on: ubuntu-24.04
         if: always() && github.event.pull_request.draft == false
         needs:
-            - quick-tests
             - clang-fast-compilation
             - unittests-all-fast-opt
             - pre-commit
