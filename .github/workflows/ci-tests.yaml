@@ -94,6 +94,15 @@ jobs:
             CC: gcc
             CXX: g++
         steps:
+            - name: Isolate Git configuration for this job
+              shell: bash
+              run: |
+                  umask 077
+                  job_git_config=$(mktemp "$RUNNER_TEMP/gitconfig.XXXXXX")
+                  if [ -f "$HOME/.gitconfig" ]; then
+                      cp "$HOME/.gitconfig" "$job_git_config"
+                  fi
+                  echo "GIT_CONFIG_GLOBAL=$job_git_config" >> "$GITHUB_ENV"
             - uses: actions/checkout@v7
 
             - name: Check host build tools
@@ -144,7 +153,21 @@ jobs:
             - name: Get the build targets for testlib-quick-gem5-builds
               working-directory: ${{ github.workspace }}/tests
               id: build-matrix
-              run: echo "build-matrix=$(./main.py list --build-targets --exclude-tags VEGA_X86 -q | jq -ncR '[inputs]')" >>$GITHUB_OUTPUT
+              shell: bash
+              run: |
+                  # Pass workspace-relative targets between different runners.
+                  targets=$(
+                      ./main.py list --build-targets --exclude-tags VEGA_X86 -q |
+                          jq -ncR --arg prefix "$GITHUB_WORKSPACE/" '
+                              [inputs |
+                                  if startswith($prefix + "build/") then
+                                      ltrimstr($prefix)
+                                  else
+                                      error("Build target is outside the workspace: " + .)
+                                  end]
+                          '
+                  )
+                  echo "build-matrix=$targets" >> "$GITHUB_OUTPUT"
 
         outputs:
             build-matrix: ${{ steps.build-matrix.outputs.build-matrix }}
@@ -163,6 +186,15 @@ jobs:
             CC: clang-19
             CXX: clang++-19
         steps:
+            - name: Isolate Git configuration for this job
+              shell: bash
+              run: |
+                  umask 077
+                  job_git_config=$(mktemp "$RUNNER_TEMP/gitconfig.XXXXXX")
+                  if [ -f "$HOME/.gitconfig" ]; then
+                      cp "$HOME/.gitconfig" "$job_git_config"
+                  fi
+                  echo "GIT_CONFIG_GLOBAL=$job_git_config" >> "$GITHUB_ENV"
             - uses: actions/checkout@v7
 
             - name: Check host build tools
@@ -233,6 +265,15 @@ jobs:
             CC: gcc
             CXX: g++
         steps:
+            - name: Isolate Git configuration for this job
+              shell: bash
+              run: |
+                  umask 077
+                  job_git_config=$(mktemp "$RUNNER_TEMP/gitconfig.XXXXXX")
+                  if [ -f "$HOME/.gitconfig" ]; then
+                      cp "$HOME/.gitconfig" "$job_git_config"
+                  fi
+                  echo "GIT_CONFIG_GLOBAL=$job_git_config" >> "$GITHUB_ENV"
             - uses: actions/checkout@v7
 
             - name: Check host build tools
@@ -254,7 +295,10 @@ jobs:
                       testlib-host-${{ runner.os }}-${{ runner.arch }}-gcc-all-
 
             - name: Build gem5
-              run: scons --no-compress-debug ${{ matrix.build-target }} -j "$CI_BUILD_JOBS"
+              working-directory: ${{ github.workspace }}
+              env:
+                  BUILD_TARGET: ${{ matrix.build-target }}
+              run: scons --no-compress-debug "$BUILD_TARGET" -j "$CI_BUILD_JOBS"
 
             - name: Sanitize build-target for artifact name
               id: sanitize-build-target
@@ -294,6 +338,15 @@ jobs:
                 test-dir: ${{ fromJson(needs.testlib-quick-matrix.outputs.test-dirs-matrix) }}
         steps:
         # Checkout the repository then download the gem5.opt artifact.
+            - name: Isolate Git configuration for this job
+              shell: bash
+              run: |
+                  umask 077
+                  job_git_config=$(mktemp "$RUNNER_TEMP/gitconfig.XXXXXX")
+                  if [ -f "$HOME/.gitconfig" ]; then
+                      cp "$HOME/.gitconfig" "$job_git_config"
+                  fi
+                  echo "GIT_CONFIG_GLOBAL=$job_git_config" >> "$GITHUB_ENV"
             - uses: actions/checkout@v7
             - name: Check host Python
               run: python3 --version
@@ -349,6 +402,15 @@ jobs:
             CC: gcc
             CXX: g++
         steps:
+            - name: Isolate Git configuration for this job
+              shell: bash
+              run: |
+                  umask 077
+                  job_git_config=$(mktemp "$RUNNER_TEMP/gitconfig.XXXXXX")
+                  if [ -f "$HOME/.gitconfig" ]; then
+                      cp "$HOME/.gitconfig" "$job_git_config"
+                  fi
+                  echo "GIT_CONFIG_GLOBAL=$job_git_config" >> "$GITHUB_ENV"
             - uses: actions/checkout@v7
 
             - name: Check host build tools

@@ -1795,9 +1795,10 @@ zttExecuteRowUnzip(RiscvISA::MatRegContainer &dest,
 let {{
     def zttElemwiseBehaviour(op, scalar=False, unary=False):
         setup = '''
+            constexpr ZttElemwiseOp zttOp = ZttElemwiseOp::%s;
             ZttTypeInfo destType, lhsType, rhsType;
             uint32_t len;
-        '''
+        ''' % op
         if scalar:
             setup += '''
             if (!zttGetDatatype(xc, zttDest, false, zttDestType,
@@ -1812,7 +1813,7 @@ let {{
             const RegVal zttScalarType =
                 xc->readMiscReg(MISCREG_AMESTYPE);
             if (!zttValidateElementwiseTuple(
-                    xc, ZttElemwiseOp::%s, destType, lhsType, rhsType,
+                    xc, zttOp, destType, lhsType, rhsType,
                     zttDestType, zttScalarType, zttMatrixType, true))
                 return NoFault;
             uint32_t destPack, matrixPack, destGroup, matrixGroup;
@@ -1849,7 +1850,7 @@ let {{
                     matrixSource, physicalBits, rhsType, len, square);
                 zttExecuteElementwise(
                     xc, zttFpEnv, destSquare, matrixSquare, matrixSquare,
-                    destType, lhsType, rhsType, len, ZttElemwiseOp::%s,
+                    destType, lhsType, rhsType, len, zttOp,
                     true, zttScalar, scalarLeft);
                 zttInsertMOperandSquare(
                     result, physicalBits, destType, len, square,
@@ -1857,7 +1858,7 @@ let {{
             }
             zttCommitMOperand(
                 xc, destBase, destSpan, result, zttDestReg);
-            ''' % (op, op)
+            '''
         elif unary:
             setup += '''
             if (!zttGetDatatype(xc, zttDest, false, zttDestType,
@@ -1869,7 +1870,7 @@ let {{
                 return NoFault;
             rhsType = lhsType;
             if (!zttValidateElementwiseTuple(
-                    xc, ZttElemwiseOp::%s, destType, lhsType, rhsType,
+                    xc, zttOp, destType, lhsType, rhsType,
                     zttDestType, zttSrcType, zttSrcType, false))
                 return NoFault;
             uint32_t destPack, srcPack, destGroup, srcGroup;
@@ -1900,30 +1901,29 @@ let {{
                     srcSource, physicalBits, lhsType, len, square);
                 RiscvISA::MatRegContainer destSquare;
                 destSquare.zero();
-                if (zttElemwiseIsReduce(ZttElemwiseOp::%s)) {
-                    const bool column = ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::ReduceAddCol || ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::ReduceMaxCol || ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::ReduceMinCol;
+                if (zttElemwiseIsReduce(zttOp)) {
+                    const bool column =
+                        zttOp == ZttElemwiseOp::ReduceAddCol ||
+                        zttOp == ZttElemwiseOp::ReduceMaxCol ||
+                        zttOp == ZttElemwiseOp::ReduceMinCol;
                     zttExecuteReduce(
                         xc, zttFpEnv, destSquare, srcSquare, destType,
-                        lhsType, len, ZttElemwiseOp::%s, column);
-                } else if (zttElemwiseIsPrefix(ZttElemwiseOp::%s)) {
-                    const bool column = ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::PrefixAddCol || ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::PrefixMaxCol;
+                        lhsType, len, zttOp, column);
+                } else if (zttElemwiseIsPrefix(zttOp)) {
+                    const bool column =
+                        zttOp == ZttElemwiseOp::PrefixAddCol ||
+                        zttOp == ZttElemwiseOp::PrefixMaxCol;
                     zttExecutePrefix(
                         xc, zttFpEnv, destSquare, srcSquare, destType,
-                        lhsType, len, ZttElemwiseOp::%s, column);
-                } else if (zttElemwiseIsPermutation(
-                               ZttElemwiseOp::%s)) {
+                        lhsType, len, zttOp, column);
+                } else if (zttElemwiseIsPermutation(zttOp)) {
                     zttExecutePermutation(
                         xc, destSquare, srcSquare, srcSquare, destType,
-                        lhsType, lhsType, len, ZttElemwiseOp::%s);
+                        lhsType, lhsType, len, zttOp);
                 } else {
                     zttExecuteUnary(
                         xc, zttFpEnv, destSquare, srcSquare, destType,
-                        lhsType, len, ZttElemwiseOp::%s);
+                        lhsType, len, zttOp);
                 }
                 zttInsertMOperandSquare(
                     result, physicalBits, destType, len, square,
@@ -1931,7 +1931,7 @@ let {{
             }
             zttCommitMOperand(
                 xc, destBase, destSpan, result, zttDestReg);
-            ''' % tuple([op] * 13)
+            '''
         else:
             setup += '''
             if (!zttGetDatatype(xc, zttDest, false, zttDestType,
@@ -1945,7 +1945,7 @@ let {{
                 !zttTileLen(xc, rhsType, len))
                 return NoFault;
             if (!zttValidateElementwiseTuple(
-                    xc, ZttElemwiseOp::%s, destType, lhsType, rhsType,
+                    xc, zttOp, destType, lhsType, rhsType,
                     zttDestType, zttLhsType, zttRhsType, false))
                 return NoFault;
             uint32_t destPack, lhsPack, rhsPack;
@@ -1958,12 +1958,12 @@ let {{
                 !zttGroupSize(xc, rhsType, rhsGroup))
                 return NoFault;
             const bool fixedSquareOp =
-                ZttElemwiseOp::%s == ZttElemwiseOp::Gather ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::GatherRow ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddCol ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddRow ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxCol ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxRow;
+                zttOp == ZttElemwiseOp::Gather ||
+                zttOp == ZttElemwiseOp::GatherRow ||
+                zttOp == ZttElemwiseOp::ScatterAddCol ||
+                zttOp == ZttElemwiseOp::ScatterAddRow ||
+                zttOp == ZttElemwiseOp::ScatterMaxCol ||
+                zttOp == ZttElemwiseOp::ScatterMaxRow;
             if (fixedSquareOp &&
                 (destPack != 1 || lhsPack != 1 || rhsPack != 1 ||
                  rhsType.isFloating)) {
@@ -1971,10 +1971,10 @@ let {{
                 return NoFault;
             }
             const bool exponentOp =
-                ZttElemwiseOp::%s == ZttElemwiseOp::Ldexp ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::LdexpAcc ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::Rdexp ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::RdexpAcc;
+                zttOp == ZttElemwiseOp::Ldexp ||
+                zttOp == ZttElemwiseOp::LdexpAcc ||
+                zttOp == ZttElemwiseOp::Rdexp ||
+                zttOp == ZttElemwiseOp::RdexpAcc;
             if (exponentOp && rhsType.isFloating) {
                 zttSetUnsupported(xc);
                 return NoFault;
@@ -2011,27 +2011,26 @@ let {{
                     lhsSource, physicalBits, lhsType, len, square);
                 const auto rhsSquare = zttExtractMOperandSquare(
                     rhsSource, physicalBits, rhsType, len, square);
-                if (ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddCol ||
-                    ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddRow ||
-                    ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxCol ||
-                    ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxRow) {
-                    const bool column = ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::ScatterAddCol || ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::ScatterMaxCol;
+                if (zttOp == ZttElemwiseOp::ScatterAddCol ||
+                    zttOp == ZttElemwiseOp::ScatterAddRow ||
+                    zttOp == ZttElemwiseOp::ScatterMaxCol ||
+                    zttOp == ZttElemwiseOp::ScatterMaxRow) {
+                    const bool column =
+                        zttOp == ZttElemwiseOp::ScatterAddCol ||
+                        zttOp == ZttElemwiseOp::ScatterMaxCol;
                     zttExecuteScatter(
                         xc, zttFpEnv, destSquare, lhsSquare, rhsSquare,
                         destType,
-                        lhsType, rhsType, len, ZttElemwiseOp::%s, column);
-                } else if (zttElemwiseIsPermutation(
-                               ZttElemwiseOp::%s)) {
+                        lhsType, rhsType, len, zttOp, column);
+                } else if (zttElemwiseIsPermutation(zttOp)) {
                     zttExecutePermutation(
                         xc, destSquare, lhsSquare, rhsSquare, destType,
-                        lhsType, rhsType, len, ZttElemwiseOp::%s);
+                        lhsType, rhsType, len, zttOp);
                 } else {
                     zttExecuteElementwise(
                         xc, zttFpEnv, destSquare, lhsSquare, rhsSquare,
                         destType,
-                        lhsType, rhsType, len, ZttElemwiseOp::%s, false, 0);
+                        lhsType, rhsType, len, zttOp, false, 0);
                 }
                 zttInsertMOperandSquare(
                     result, physicalBits, destType, len, square,
@@ -2039,7 +2038,7 @@ let {{
             }
             zttCommitMOperand(
                 xc, destBase, destSpan, result, zttDestReg);
-            ''' % tuple([op] * 21)
+            '''
         return setup
 }};
 
