@@ -14,7 +14,6 @@ concurrency:
 # Six runners share open06. Limit build and simulation parallelism.
 # Jobs run on the host; these settings are not CPU or memory hard limits.
 # Repository Actions variables can override these defaults.
-# The self-hosted runners must share the same NFS home directory.
 env:
     CI_BUILD_JOBS: ${{ vars.CI_BUILD_JOBS || '16' }}
     CI_TEST_THREADS: ${{ vars.CI_TEST_THREADS || '2' }}
@@ -67,11 +66,11 @@ jobs:
 
     unittests-all-fast-opt:
         strategy:
+            fail-fast: false
             matrix:
                 type: [fast, opt]
         runs-on: [self-hosted, linux, x64, bosc, open]
         if: github.event.pull_request.draft == false
-        needs: [pre-commit] # only runs if pre-commit passes.
         timeout-minutes: 60
         env:
             CC: gcc
@@ -101,69 +100,13 @@ jobs:
               run: scons --no-compress-debug build/ALL/unittests.${{ matrix.type }} -j "$CI_BUILD_JOBS"
             - run: echo "This job's status is ${{ job.status }}."
 
-    testlib-quick-matrix:
-        runs-on: ubuntu-24.04
-        if: github.event.pull_request.draft == false
-        needs: [pre-commit]
-        steps:
-            - uses: actions/checkout@v7
-            - name: Install jq
-              run: sudo apt-get update && sudo apt-get install -y jq
-
-            - name: Get directories for testlib-quick
-              working-directory: ${{ github.workspace }}/tests
-              id: dir-matrix
-              run: |
-                  unset PREV
-                  echo "test-dirs-matrix=$(\
-                    ./main.py list gem5 \
-                    --suites \
-                    --exclude-tags gcn_gpu | \
-                    grep '^SuiteUID:' | \
-                    cut -d: -f2 | \
-                    cut -d/ -f 2- | \
-                    xargs dirname | \
-                    sort -u  | \
-                    while read x; do \
-                      if [ -z "${PREV}" ] || [ "$x" != "${PREV}/*" ]; then \
-                        PREV=$x; \
-                        echo $x; \
-                      fi; \
-                    done  | \
-                    jq -ncR '[inputs]'\
-                  )" >>$GITHUB_OUTPUT
-
-            - name: Get the build targets for testlib-quick-gem5-builds
-              working-directory: ${{ github.workspace }}/tests
-              id: build-matrix
-              shell: bash
-              run: |
-                  # Pass workspace-relative targets between different runners.
-                  targets=$(
-                      ./main.py list --build-targets --exclude-tags VEGA_X86 -q |
-                          jq -ncR --arg prefix "$GITHUB_WORKSPACE/" '
-                              [inputs |
-                                  if startswith($prefix + "build/") then
-                                      ltrimstr($prefix)
-                                  else
-                                      error("Build target is outside the workspace: " + .)
-                                  end]
-                          '
-                  )
-                  echo "build-matrix=$targets" >> "$GITHUB_OUTPUT"
-
-        outputs:
-            build-matrix: ${{ steps.build-matrix.outputs.build-matrix }}
-            test-dirs-matrix: ${{ steps.dir-matrix.outputs.test-dirs-matrix }}
-
     clang-fast-compilation:
-        # gem5 binaries built in `quick-gem5-builds` always use GCC.
+        # The quick-tests job builds gem5.opt with GCC.
         # Clang is more strict than GCC. This job checks that gem5 compiles
         # with Clang. It compiles build/ALL/gem5.fast to maximize the change
         # for compilation error to be exposed.
         runs-on: [self-hosted, linux, x64, bosc, open]
         if: github.event.pull_request.draft == false
-        needs: [pre-commit]
         timeout-minutes: 90
         env:
             CC: clang-19
@@ -192,14 +135,13 @@ jobs:
               working-directory: ${{ github.workspace }}
               run: scons build/ALL/gem5.fast -j "$CI_BUILD_JOBS"
 
-    testlib-quick-gem5-builds:
+    quick-tests:
         runs-on: [self-hosted, linux, x64, bosc, open]
         if: github.event.pull_request.draft == false
-        needs: [pre-commit, testlib-quick-matrix]
-        strategy:
-            max-parallel: 3
-            matrix:
-                build-target: ${{ fromJson(needs.testlib-quick-matrix.outputs.build-matrix) }}
+        timeout-minutes: 360 # Includes compilation and test execution.
+        defaults:
+            run:
+                shell: bash
         env:
             CC: gcc
             CXX: g++
@@ -224,98 +166,21 @@ jobs:
                   python3-config --includes
                   pkg-config --exists python3-embed protobuf zlib
 
-            - name: Build gem5
+            - name: Build gem5 for quick tests
               working-directory: ${{ github.workspace }}
-              env:
-                  BUILD_TARGET: ${{ matrix.build-target }}
-              run: scons --no-compress-debug "$BUILD_TARGET" -j "$CI_BUILD_JOBS"
+              run: scons --no-compress-debug build/ALL/gem5.opt -j "$CI_BUILD_JOBS"
 
-            - name: Share gem5 binary with test runners
-              shell: bash
-              env:
-                  BUILD_TARGET: ${{ matrix.build-target }}
-              run: |
-                  umask 077
-                  [[ "$BUILD_TARGET" =~ ^build/[A-Za-z0-9_-]+/gem5\.(opt|fast|debug)$ ]]
-                  test -x "$BUILD_TARGET"
-                  shared_dir="$HOME/.cache/ame-gem5-ci/$GITHUB_REPOSITORY"
-                  shared_dir="$shared_dir/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
-                  destination="$shared_dir/$BUILD_TARGET"
-                  mkdir -p "$(dirname "$destination")"
-                  cp --reflink=auto -- "$BUILD_TARGET" "$destination.tmp"
-                  mv -- "$destination.tmp" "$destination"
-                  printf '%s\n' "$GITHUB_SHA" > "$destination.sha"
-
-    testlib-quick-execution:
-        name: quick-tests
-        runs-on: [self-hosted, linux, x64, bosc, open]
-        if: github.event.pull_request.draft == false
-        needs: [pre-commit, testlib-quick-matrix, testlib-quick-gem5-builds]
-        timeout-minutes: 360 # 6 hours
-        strategy:
-            fail-fast: false
-            max-parallel: 4
-            matrix:
-                test-dir: ${{ fromJson(needs.testlib-quick-matrix.outputs.test-dirs-matrix) }}
-        steps:
-        # Checkout the repository then use this run's shared gem5 binaries.
-            - name: Isolate Git configuration for this job
-              shell: bash
-              run: |
-                  umask 077
-                  job_git_config=$(mktemp "$RUNNER_TEMP/gitconfig.XXXXXX")
-                  if [ -f "$HOME/.gitconfig" ]; then
-                      cp "$HOME/.gitconfig" "$job_git_config"
-                  fi
-                  echo "GIT_CONFIG_GLOBAL=$job_git_config" >> "$GITHUB_ENV"
-            - uses: actions/checkout@v7
-            - name: Check host Python
-              run: python3 --version
-            - name: Link shared gem5 binaries
-              shell: bash
-              env:
-                  BUILD_TARGETS: ${{ needs.testlib-quick-matrix.outputs.build-matrix }}
-              run: |
-                  shared_dir="$HOME/.cache/ame-gem5-ci/$GITHUB_REPOSITORY"
-                  shared_dir="$shared_dir/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
-                  targets=$(python3 -c 'import json, os; print("\n".join(json.loads(os.environ["BUILD_TARGETS"])))')
-                  while IFS= read -r target; do
-                      [[ "$target" =~ ^build/[A-Za-z0-9_-]+/gem5\.(opt|fast|debug)$ ]]
-                      source="$shared_dir/$target"
-                      test -x "$source"
-                      test "$(cat "$source.sha")" = "$GITHUB_SHA"
-                      mkdir -p "$(dirname "$target")"
-                      ln -s -- "$source" "$target"
-                  done <<< "$targets"
-
-        # Run the testlib quick tests in the given directory.
-            - name: Run quick ${{ matrix.test-dir }} tests
+            - name: Run quick tests
               working-directory: ${{ github.workspace }}/tests
               run: >-
-                  ./main.py run --skip-build
-                  -t "$CI_TEST_THREADS" --exclude-tags gcn_gpu
-                  ${{ matrix.test-dir }}
-
-    cleanup-shared-builds:
-        # Re-run all jobs to rebuild binaries removed after an earlier attempt.
-        runs-on: [self-hosted, linux, x64, bosc, open]
-        if: always() && github.event.pull_request.draft == false
-        needs: [testlib-quick-gem5-builds, testlib-quick-execution]
-        steps:
-            - name: Remove this run's shared binaries
-              shell: bash
-              run: |
-                  [[ "$GITHUB_RUN_ID" =~ ^[0-9]+$ ]]
-                  [[ "$GITHUB_RUN_ATTEMPT" =~ ^[0-9]+$ ]]
-                  shared_dir="${HOME:?}/.cache/ame-gem5-ci/${GITHUB_REPOSITORY:?}"
-                  rm -rf -- "$shared_dir/$GITHUB_RUN_ID/$GITHUB_RUN_ATTEMPT"
+                  ./main.py run gem5 --skip-build --length quick --variant opt
+                  -t "$CI_TEST_THREADS" --exclude-tags gcn_gpu -v
 
 # Custom Ztt floating-point unit tests.
     ztt-tests:
         name: ztt-float-unit-test
         runs-on: [self-hosted, linux, x64, bosc, open]
         if: github.event.pull_request.draft == false
-        needs: [pre-commit]
         timeout-minutes: 120
         defaults:
             run:
@@ -358,12 +223,12 @@ jobs:
                     2>&1 | tee ci-results/ztt-float.log
 
     ci-tests:
-    # Keep one required check that fails when any dependency fails or skips.
+    # Wait for all independent checks, including both unit-test variants.
+    # Only an all-success result passes this required check.
         runs-on: ubuntu-24.04
         if: always() && github.event.pull_request.draft == false
         needs:
-            - testlib-quick-execution
-            - cleanup-shared-builds
+            - quick-tests
             - clang-fast-compilation
             - unittests-all-fast-opt
             - pre-commit
@@ -380,3 +245,4 @@ jobs:
                           exit 1
                       fi
                   done
+                  echo "All required checks passed."
