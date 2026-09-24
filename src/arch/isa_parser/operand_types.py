@@ -637,30 +637,22 @@ class ZttAccDataRegOperand(ZttMatDataRegOperand):
 
 class ZttMatRegIndexOperandDesc(RegOperandDesc):
     def __init__(self, *args, **kwargs):
-        super().__init__(
-            "matRegClass", ZttMatRegIndexOperand, *args, **kwargs
-        )
+        super().__init__("matRegClass", ZttMatRegIndexOperand, *args, **kwargs)
 
 
 class ZttAccRegIndexOperandDesc(RegOperandDesc):
     def __init__(self, *args, **kwargs):
-        super().__init__(
-            "matRegClass", ZttAccRegIndexOperand, *args, **kwargs
-        )
+        super().__init__("matRegClass", ZttAccRegIndexOperand, *args, **kwargs)
 
 
 class ZttMatDataRegOperandDesc(RegOperandDesc):
     def __init__(self, *args, **kwargs):
-        super().__init__(
-            "matRegClass", ZttMatDataRegOperand, *args, **kwargs
-        )
+        super().__init__("matRegClass", ZttMatDataRegOperand, *args, **kwargs)
 
 
 class ZttAccDataRegOperandDesc(RegOperandDesc):
     def __init__(self, *args, **kwargs):
-        super().__init__(
-            "matRegClass", ZttAccDataRegOperand, *args, **kwargs
-        )
+        super().__init__("matRegClass", ZttAccDataRegOperand, *args, **kwargs)
 
 
 class ControlRegOperand(RegOperand):
