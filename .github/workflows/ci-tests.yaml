@@ -1,5 +1,5 @@
 ---
-# This workflow runs after a pull-request has been approved by a reviewer.
+# Run checks when a pull request is opened, updated, or marked ready.
 
 name: CI Tests
 
@@ -10,6 +10,13 @@ on:
 concurrency:
     group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
     cancel-in-progress: true
+
+# Six runners share open06. Limit build and simulation parallelism.
+# Jobs run on the host; these settings are not CPU or memory hard limits.
+# Repository Actions variables can override these defaults.
+env:
+    CI_BUILD_JOBS: ${{ vars.CI_BUILD_JOBS || '16' }}
+    CI_TEST_THREADS: ${{ vars.CI_TEST_THREADS || '2' }}
 
 jobs:
     pre-commit:
@@ -79,27 +86,38 @@ jobs:
         strategy:
             matrix:
                 type: [fast, opt]
-        runs-on: [self-hosted, linux, x64]
+        runs-on: [self-hosted, linux, x64, bosc, open]
         if: github.event.pull_request.draft == false
-        container: ghcr.io/gem5/ubuntu-24.04_all-dependencies:latest
         needs: [pre-commit] # only runs if pre-commit passes.
         timeout-minutes: 60
+        env:
+            CC: gcc
+            CXX: g++
         steps:
             - uses: actions/checkout@v7
+
+            - name: Check host build tools
+              run: |
+                  for tool in "$CC" "$CXX" scons python3 python3-config pkg-config protoc make; do
+                      command -v "$tool" || exit 1
+                  done
+                  "$CC" --version
+                  python3-config --includes
+                  pkg-config --exists python3-embed protobuf zlib
             - name: CI Unittests (${{ matrix.type }})
               working-directory: ${{ github.workspace }}
-              run: scons --no-compress-debug build/ALL/unittests.${{ matrix.type }} -j $(nproc)
+              run: scons --no-compress-debug build/ALL/unittests.${{ matrix.type }} -j "$CI_BUILD_JOBS"
             - run: echo "This job's status is ${{ job.status }}."
 
     testlib-quick-matrix:
         runs-on: ubuntu-24.04
         if: github.event.pull_request.draft == false
-    # In order to make sure the environment is exactly the same, we run in
-    # the same container we use to build gem5 and run the testlib tests. This
-        container: ghcr.io/gem5/ubuntu-24.04_all-dependencies:latest
         needs: [pre-commit]
         steps:
             - uses: actions/checkout@v7
+            - name: Install jq
+              run: sudo apt-get update && sudo apt-get install -y jq
+
             - name: Get directories for testlib-quick
               working-directory: ${{ github.workspace }}/tests
               id: dir-matrix
@@ -109,7 +127,7 @@ jobs:
                     ./main.py list gem5 \
                     --suites \
                     --exclude-tags gcn_gpu | \
-                    grep "$SUITEUID:" | \
+                    grep '^SuiteUID:' | \
                     cut -d: -f2 | \
                     cut -d/ -f 2- | \
                     xargs dirname | \
@@ -137,16 +155,27 @@ jobs:
         # Clang is more strict than GCC. This job checks that gem5 compiles
         # with Clang. It compiles build/ALL/gem5.fast to maximize the change
         # for compilation error to be exposed.
-        runs-on: [self-hosted, linux, x64]
+        runs-on: [self-hosted, linux, x64, bosc, open]
         if: github.event.pull_request.draft == false
-        container: ghcr.io/gem5/clang-version-19:latest
         needs: [pre-commit]
         timeout-minutes: 90
+        env:
+            CC: clang-19
+            CXX: clang++-19
         steps:
             - uses: actions/checkout@v7
+
+            - name: Check host build tools
+              run: |
+                  for tool in "$CC" "$CXX" scons python3 python3-config pkg-config protoc make; do
+                      command -v "$tool" || exit 1
+                  done
+                  "$CC" --version
+                  python3-config --includes
+                  pkg-config --exists python3-embed protobuf zlib
             - name: Clang Compilation
               working-directory: ${{ github.workspace }}
-              run: scons build/ALL/gem5.fast -j $(nproc)
+              run: scons build/ALL/gem5.fast -j "$CI_BUILD_JOBS"
 
     macos-compilation:
         runs-on: macos-26
@@ -173,6 +202,11 @@ jobs:
                     grpc \
                     boost
 
+            - name: Configure Boost include path
+              run: |
+                  BOOST_INCLUDE="$(brew --prefix boost)/include"
+                  test -f "$BOOST_INCLUDE/boost/multiprecision/cpp_int.hpp"
+                  echo "CPATH=$BOOST_INCLUDE${CPATH:+:$CPATH}" >> "$GITHUB_ENV"
 
             - name: Restore macOS build/ALL cache
               uses: actions/cache/restore@v6
@@ -188,32 +222,48 @@ jobs:
               timeout-minutes: 90
 
     testlib-quick-gem5-builds:
-        runs-on: [self-hosted, linux, x64]
+        runs-on: [self-hosted, linux, x64, bosc, open]
         if: github.event.pull_request.draft == false
-        container: ghcr.io/gem5/ubuntu-24.04_all-dependencies:latest
         needs: [pre-commit, testlib-quick-matrix, get-date]
         strategy:
+            max-parallel: 3
             matrix:
                 build-target: ${{ fromJson(needs.testlib-quick-matrix.outputs.build-matrix) }}
+        env:
+            CC: gcc
+            CXX: g++
         steps:
             - uses: actions/checkout@v7
+
+            - name: Check host build tools
+              run: |
+                  for tool in "$CC" "$CXX" scons python3 python3-config pkg-config protoc make; do
+                      command -v "$tool" || exit 1
+                  done
+                  "$CC" --version
+                  python3-config --includes
+                  pkg-config --exists python3-embed protobuf zlib
 
             - name: Cache build/ALL
               uses: actions/cache/restore@v6
               if: ${{ endsWith(matrix.build-target, 'build/ALL/gem5.opt') }}
               with:
                   path: build/ALL
-                  key: testlib-build-all-${{ needs.get-date.outputs.date }}
+                  key: testlib-host-${{ runner.os }}-${{ runner.arch }}-gcc-all-${{ needs.get-date.outputs.date }}
                   restore-keys: |
-                      testlib-build-all
+                      testlib-host-${{ runner.os }}-${{ runner.arch }}-gcc-all-
 
             - name: Build gem5
-              run: scons --no-compress-debug ${{ matrix.build-target }} -j $(nproc)
+              run: scons --no-compress-debug ${{ matrix.build-target }} -j "$CI_BUILD_JOBS"
 
             - name: Sanitize build-target for artifact name
               id: sanitize-build-target
               if: success() || failure()
-              run: echo "sanitized-build-target=$(echo '${{ matrix.build-target }}' | sed 's/[\\|\.]/-/g' | sed 's/[\/|__w|gem5|build]//g')" >> $GITHUB_OUTPUT
+              env:
+                  BUILD_TARGET: ${{ matrix.build-target }}
+              run: |
+                  name=$(printf '%s' "$BUILD_TARGET" | tr '/.' '--')
+                  echo "sanitized-build-target=$name" >> "$GITHUB_OUTPUT"
 
         # Upload the gem5 binary as an artifact.
         # Note: the "achor.txt" file is a hack to make sure the paths are
@@ -233,18 +283,20 @@ jobs:
 
     testlib-quick-execution:
         name: quick-tests
-        runs-on: [self-hosted, linux, x64]
+        runs-on: [self-hosted, linux, x64, bosc, open]
         if: github.event.pull_request.draft == false
-        container: ghcr.io/gem5/ubuntu-24.04_all-dependencies:latest
         needs: [pre-commit, testlib-quick-matrix, testlib-quick-gem5-builds]
         timeout-minutes: 360 # 6 hours
         strategy:
             fail-fast: false
+            max-parallel: 4
             matrix:
                 test-dir: ${{ fromJson(needs.testlib-quick-matrix.outputs.test-dirs-matrix) }}
         steps:
         # Checkout the repository then download the gem5.opt artifact.
             - uses: actions/checkout@v7
+            - name: Check host Python
+              run: python3 --version
             - uses: actions/download-artifact@v8
               name: Download gem5 artifacts
               with:
@@ -262,7 +314,10 @@ jobs:
             - name: Run quick ${{ matrix.test-dir }} tests
               id: run-tests
               working-directory: ${{ github.workspace }}/tests
-              run: ./main.py run --skip-build --exclude-tags gcn_gpu ${{  matrix.test-dir }}
+              run: >-
+                  ./main.py run --skip-build
+                  -t "$CI_TEST_THREADS" --exclude-tags gcn_gpu
+                  ${{ matrix.test-dir }}
 
         # Get the basename of the matrix.test-dir path (to name the artifact).
             - name: Sanitize test-dir for artifact name
@@ -280,47 +335,97 @@ jobs:
                   path: tests/testing-results
                   retention-days: 30
 
-    gpu-tests:
-        runs-on: [self-hosted, linux, x64]
-        container: ghcr.io/gem5/gcn-gpu:latest
-        timeout-minutes: 180
-        needs: [pre-commit, get-date]
+# Custom Ztt tests: floating-point unit tests and the gemm_fp32 workload.
+    ztt-tests:
+        name: Ztt float unit tests and GEMM FP32
+        runs-on: [self-hosted, linux, x64, bosc, open]
+        if: github.event.pull_request.draft == false
+        needs: [pre-commit]
+        timeout-minutes: 120
+        defaults:
+            run:
+                shell: bash
+        env:
+            CC: gcc
+            CXX: g++
         steps:
             - uses: actions/checkout@v7
 
-            # Obtain the cache if available.
-            - name: Cache build/VEGA_X86
-              uses: actions/cache/restore@v6
-              with:
-                  path: build/VEGA_X86
-                  key: testlib-build-vega-${{ needs.get-date.outputs.date }}
-                  restore-keys: |
-                      testlib-build-vega
+            - name: Check host build tools
+              run: |
+                  for tool in "$CC" "$CXX" scons python3 python3-config pkg-config protoc make; do
+                      command -v "$tool" || exit 1
+                  done
+                  "$CC" --version
+                  python3-config --includes
+                  pkg-config --exists python3-embed protobuf zlib
 
-            # Run the GPU tests.
-            - name: Run Testlib GPU Tests
-              id: run-tests
-              working-directory: ${{ github.workspace }}/tests
-              run: ./main.py run -j$(nproc) -t$(nproc) --host gcn_gpu --isa=VEGA_X86
+            - name: Build Ztt floating-point unit tests
+              run: |
+                  mkdir -p ci-results
+                  scons build/RISCV/arch/riscv/insts/ztt_float.test.opt \
+                    -j "$CI_BUILD_JOBS" 2>&1 | tee ci-results/ztt-float-build.log
 
-            # Upload the tests/testing-results directory as an artifact.
-            - name: Upload results
+            - name: Run Ztt floating-point unit tests
+              timeout-minutes: 5
+              run: |
+                  build/RISCV/arch/riscv/insts/ztt_float.test.opt \
+                    --gtest_output=xml:ci-results/ztt-float.xml \
+                    2>&1 | tee ci-results/ztt-float.log
+
+            - name: Install packaged AME toolchain
+              run: |
+                  git -c \
+                    url."https://github.com/OpenXiangShan/AME_llvm.git".insteadOf=git@github.com:OpenXiangShan/AME_llvm.git \
+                    submodule update --init --recursive
+                  ./scripts/build_toolchain.sh
+
+            - name: Build RISC-V gem5
+              run: |
+                  mkdir -p ci-results
+                  scons --no-compress-debug build/RISCV/gem5.opt \
+                    -j "$CI_BUILD_JOBS" 2>&1 | tee ci-results/ztt-build.log
+
+            - name: Compare GEMM with checked-in reference
+              timeout-minutes: 10
+              run: |
+                  make -C example/gemm_fp32 test-reference \
+                    BUILD_DIR="$GITHUB_WORKSPACE/ci-results/reference"
+
+            - name: Compare GEMM with host C golden
+              timeout-minutes: 10
+              run: |
+                  make -C example/gemm_fp32 test-host-golden \
+                    BUILD_DIR="$GITHUB_WORKSPACE/ci-results/host-golden"
+
+            - name: Upload Ztt test results
               if: success() || failure()
               uses: actions/upload-artifact@v7
               with:
-                  name: ci-tests-run-${{ github.run_number }}-attempt-${{ github.run_attempt }}-gpu-status-${{ steps.run-tests.outcome }}-output
-                  path: tests/testing-results
+                  name: ztt-tests-${{ github.run_id }}-${{ github.run_attempt }}
+                  path: ci-results/
+                  retention-days: 7
 
     ci-tests:
-    # It is 'testlib-quick' which needs to pass for the pull request to be
-    # merged. This job is a dummy job that depends on all the other jobs.
+    # Keep one required check that fails when any dependency fails or skips.
         runs-on: ubuntu-24.04
+        if: always() && github.event.pull_request.draft == false
         needs:
             - testlib-quick-execution
             - clang-fast-compilation
             - unittests-all-fast-opt
             - macos-compilation
             - pre-commit
-            - gpu-tests
+            - clang-format-check
+            - ztt-tests
         steps:
-            - run: echo "This job's status is ${{ job.status }}."
+            - name: Check all required jobs
+              env:
+                  JOB_RESULTS: ${{ join(needs.*.result, ' ') }}
+              run: |
+                  for result in $JOB_RESULTS; do
+                      if [ "$result" != success ]; then
+                          echo "Required job did not succeed: $result"
+                          exit 1
+                      fi
+                  done
