@@ -48,7 +48,6 @@ import struct
 from pathlib import Path
 from typing import Any
 
-
 REPORT_VERSION = 1
 
 
@@ -98,9 +97,7 @@ def input_spec(path: Path) -> dict[str, Any]:
             return [default] * (rows * cols)
         if not isinstance(data, list) or len(data) != rows * cols:
             count = rows * cols
-            raise SystemExit(
-                f"{name} must contain {count} row-major values"
-            )
+            raise SystemExit(f"{name} must contain {count} row-major values")
         return [as_f32(item, name) for item in data]
 
     name = str(value.get("name", path.stem))
@@ -226,8 +223,7 @@ def write_report(args: argparse.Namespace) -> None:
     else:
         samples = [values[(i * len(values)) // 32] for i in range(32)]
     bits = [
-        struct.unpack("<I", struct.pack("<f", value))[0]
-        for value in samples
+        struct.unpack("<I", struct.pack("<f", value))[0] for value in samples
     ]
     lines = [
         "Ztt GEMM result report (UTF-8)",
@@ -241,8 +237,7 @@ def write_report(args: argparse.Namespace) -> None:
         f"  [002] 0x{fnv1a(values):016x}",
     ]
     lines.extend(
-        f"  [{index + 3:03d}] 0x{item:016x}"
-        for index, item in enumerate(bits)
+        f"  [{index + 3:03d}] 0x{item:016x}" for index, item in enumerate(bits)
     )
     lines.extend(["", ""])
     args.output.parent.mkdir(parents=True, exist_ok=True)

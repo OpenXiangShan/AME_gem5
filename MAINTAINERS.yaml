@@ -207,6 +207,60 @@ misc:
     experts:
         - Jason Lowe-Power <jason@lowepower.com>
 
+npu:
+    desc: >-
+        General changes to NPU components
+    status: maintained
+    maintainers:
+        - zhaoruiqi <zhaoruiqi@bosc.ac.cn>
+        - zhangbosc25 <zhangbosc25@gmail.com>
+        - xiangyy <xiangyuanyang2020@ia.ac.cn>
+
+npu-matrix:
+    desc: >-
+        NPU matrix core
+    status: maintained
+    maintainers:
+        - zhaoruiqi <zhaoruiqi@bosc.ac.cn>
+        - zhangbosc25 <zhangbosc25@gmail.com>
+        - xiangyy <xiangyuanyang2020@ia.ac.cn>
+
+npu-vector:
+    desc: >-
+        NPU vector core
+    status: maintained
+    maintainers:
+        - zhaoruiqi <zhaoruiqi@bosc.ac.cn>
+        - zhangbosc25 <zhangbosc25@gmail.com>
+        - xiangyy <xiangyuanyang2020@ia.ac.cn>
+
+npu-dma:
+    desc: >-
+        NPU DMA engines
+    status: maintained
+    maintainers:
+        - zhaoruiqi <zhaoruiqi@bosc.ac.cn>
+        - zhangbosc25 <zhangbosc25@gmail.com>
+        - xiangyy <xiangyuanyang2020@ia.ac.cn>
+
+npu-spm:
+    desc: >-
+        NPU scratchpad memory
+    status: maintained
+    maintainers:
+        - zhaoruiqi <zhaoruiqi@bosc.ac.cn>
+        - zhangbosc25 <zhangbosc25@gmail.com>
+        - xiangyy <xiangyuanyang2020@ia.ac.cn>
+
+operator:
+    desc: >-
+        Operator workloads and examples
+    status: maintained
+    maintainers:
+        - zhaoruiqi <zhaoruiqi@bosc.ac.cn>
+        - zhangbosc25 <zhangbosc25@gmail.com>
+        - xiangyy <xiangyuanyang2020@ia.ac.cn>
+
 python:
     desc: >-
         Python SimObject wrapping and infrastructure
