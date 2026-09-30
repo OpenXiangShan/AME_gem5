@@ -27,7 +27,8 @@ See the community release of spec Ztt v0.6 for details.
 ### Prerequisites
 
 - A C++ compiler, Python 3, SCons, and the other gem5 dependencies. See the [gem5 build documentation](https://www.gem5.org/documentation/general_docs/building/).
-- Git with submodule support.
+- A RISC-V GNU toolchain with binutils and libgcc.a.
+- An LLVM-based RISC-V toolchain with AME Ztt v0.6 support.
 
 ### Build gem5
 
@@ -37,7 +38,7 @@ In the AME_gem5 root directory:
 scons build/RISCV/gem5.opt -j$(nproc)
 ```
 
-Then, install the packaged AME LLVM and GNU RISC-V toolchain:
+Then, install the toolchain:
 
 ```sh
 ./scripts/build_toolchain.sh

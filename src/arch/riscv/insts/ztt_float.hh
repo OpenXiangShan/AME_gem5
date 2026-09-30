@@ -100,6 +100,9 @@ class ZttFloatBackend
                             ZttNarrowFloatFormat format,
                             ZttFloatRoundingMode rounding,
                             bool difference);
+    static uint16_t absDiff(uint16_t lhs, uint16_t rhs,
+                            ZttNarrowFloatFormat format,
+                            ZttFloatRoundingMode rounding);
     static uint16_t scale(uint16_t raw, int exponent,
                           ZttNarrowFloatFormat format,
                           ZttFloatRoundingMode rounding);

@@ -43,30 +43,60 @@ LLVM_ARCHIVE_CHECKSUM="$LLVM_SUBMODULE/ame_toolchain.sha256"
 ARCHIVE_TO_EXTRACT="$LLVM_ARCHIVE"
 MERGED_ARCHIVE=""
 
-# Prefer SSH for submodule access, but keep HTTPS available for environments
-# without GitHub SSH access. The rewrite is scoped to this invocation.
-git -C "$REPO_ROOT" submodule sync --recursive
-if ! git -C "$REPO_ROOT" submodule update --init --recursive; then
-    echo "[WARN] SSH submodule access failed; retrying with HTTPS" >&2
-    git -C "$REPO_ROOT" \
-        -c "url.$SUBMODULE_HTTPS_URL.insteadOf=$SUBMODULE_SSH_URL" \
-        submodule update --init --recursive
-fi
+verify_checksum() {
+    local archive=$1
+    local expected_checksum
 
-if [[ ! -f "$LLVM_ARCHIVE" ]]; then
+    expected_checksum=$(awk 'NF { print $1; exit }' "$LLVM_ARCHIVE_CHECKSUM")
+    if [[ ! "$expected_checksum" =~ ^[[:xdigit:]]{64}$ ]]; then
+        echo "[ERROR] Invalid SHA256 checksum in $LLVM_ARCHIVE_CHECKSUM" >&2
+        return 1
+    fi
+
+    printf '%s  %s\n' "$expected_checksum" "$archive" | sha256sum -c -
+}
+
+if [[ -f "$LLVM_ARCHIVE" ]]; then
+    echo "[INFO] Found complete toolchain archive: $LLVM_ARCHIVE"
+    if [[ -f "$LLVM_ARCHIVE_CHECKSUM" ]]; then
+        verify_checksum "$LLVM_ARCHIVE"
+    else
+        echo "[WARN] Checksum file not found; verifying archive integrity only" >&2
+    fi
+else
+    # The complete archive can be placed in AME_llvm before the submodule is
+    # initialized. Only access the submodule when split archive input is needed.
+    git -C "$REPO_ROOT" submodule sync --recursive
+    if ! git -C "$REPO_ROOT" submodule update --init --recursive; then
+        echo "[WARN] SSH submodule access failed; retrying with HTTPS" >&2
+        git -C "$REPO_ROOT" \
+            -c "url.$SUBMODULE_HTTPS_URL.insteadOf=$SUBMODULE_SSH_URL" \
+            submodule update --init --recursive
+    fi
+
+    if [[ ! -f "$LLVM_ARCHIVE_CHECKSUM" ]]; then
+        echo "[ERROR] Checksum file not found: $LLVM_ARCHIVE_CHECKSUM" >&2
+        exit 1
+    fi
+
+    mapfile -t archive_parts < <(
+        find "$LLVM_SUBMODULE" -maxdepth 1 -type f \
+            -name "$(basename "$LLVM_ARCHIVE_PART_PREFIX")*" -print | sort -V
+    )
+    if (( ${#archive_parts[@]} == 0 )); then
+        echo "[ERROR] No toolchain archive or archive parts found in $LLVM_SUBMODULE" >&2
+        exit 1
+    fi
+
     MERGED_ARCHIVE=$(mktemp "$REPO_ROOT/toolchain/.ame_toolchain.XXXXXX.tar.gz")
     trap 'rm -f -- "$MERGED_ARCHIVE"' EXIT
-    cat $(find "$LLVM_SUBMODULE" -maxdepth 1 -type f \
-        -name "$(basename "$LLVM_ARCHIVE_PART_PREFIX")*" | sort -V) \
-        > "$MERGED_ARCHIVE"
-    (
-        cd "$LLVM_SUBMODULE"
-        printf '%s  %s\n' \
-            "$(awk 'NF { print $1; exit }' "$LLVM_ARCHIVE_CHECKSUM")" \
-            "$MERGED_ARCHIVE" | sha256sum -c -
-    )
+    cat "${archive_parts[@]}" > "$MERGED_ARCHIVE"
+    verify_checksum "$MERGED_ARCHIVE"
     ARCHIVE_TO_EXTRACT="$MERGED_ARCHIVE"
 fi
+
+echo "[INFO] Checking toolchain archive integrity"
+tar -tzf "$ARCHIVE_TO_EXTRACT" > /dev/null
 
 rm -rf -- "$INSTALL_DIR"
 mkdir -p -- "$INSTALL_DIR"
