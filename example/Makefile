@@ -32,7 +32,8 @@ SHELL := /bin/bash
 CASES := \
 	gemm_fp32 \
 	gemm_int8 \
-	gemm_mixed
+	gemm_mixed \
+	gelu
 
 BUILD_DIR := $(CURDIR)/build
 SUITE_REPORT := $(BUILD_DIR)/reports/EXAMPLE_REPORT.md
