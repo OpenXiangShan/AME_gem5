@@ -739,6 +739,48 @@ ZttFloatBackend::halfSum(uint16_t lhs, uint16_t rhs,
 }
 
 uint16_t
+ZttFloatBackend::absDiff(uint16_t lhs, uint16_t rhs,
+                         ZttNarrowFloatFormat format,
+                         ZttFloatRoundingMode rounding)
+{
+    const bool lhsNaN = isNaN(lhs, format);
+    const bool rhsNaN = isNaN(rhs, format);
+    if (lhsNaN || rhsNaN) {
+        if ((lhsNaN && isSignalingNaN(lhs, format)) ||
+            (rhsNaN && isSignalingNaN(rhs, format)))
+            softfloat_raiseFlags(softfloat_flag_invalid);
+        return canonicalNaN(format);
+    }
+    const bool lhsInf = isInf(lhs, format);
+    const bool rhsInf = isInf(rhs, format);
+    if (lhsInf || rhsInf) {
+        if (lhsInf && rhsInf &&
+            ((lhs ^ rhs) & (format == ZttNarrowFloatFormat::Bf16 ?
+                             0x8000 : 0x80)) == 0) {
+            softfloat_raiseFlags(softfloat_flag_invalid);
+            return canonicalNaN(format);
+        }
+        return format == ZttNarrowFloatFormat::Bf16 ? 0x7f80 :
+            (format == ZttNarrowFloatFormat::E4M3 ? 0x7e : 0x7c);
+    }
+
+    const Dyadic left = finiteDyadic(lhs, format);
+    const Dyadic right = finiteDyadic(rhs, format);
+    const int commonExponent = std::min(left.exponent, right.exponent);
+    const cpp_int leftValue =
+        left.coefficient << (left.exponent - commonExponent);
+    const cpp_int rightValue =
+        right.coefficient << (right.exponent - commonExponent);
+    cpp_int difference = leftValue - rightValue;
+    if (!difference) {
+        return 0;
+    }
+    if (difference < 0)
+        difference = -difference;
+    return roundDyadic(difference, commonExponent, format, rounding);
+}
+
+uint16_t
 ZttFloatBackend::scale(uint16_t raw, int exponent,
                        ZttNarrowFloatFormat format,
                        ZttFloatRoundingMode rounding)

@@ -454,10 +454,9 @@ zttScalarRaw(ExecContext *xc, RegVal scalar, const ZttTypeInfo &type)
     const uint32_t sourceBits = std::min(type.bits, xlen);
     unsigned __int128 raw = static_cast<unsigned __int128>(scalar) &
         zttBitMask128(sourceBits);
-    if (!type.isFloating && type.isSigned && type.bits > sourceBits &&
-        ((raw >> (sourceBits - 1)) & 1)) {
-        raw |= zttBitMask128(type.bits) & ~zttBitMask128(sourceBits);
-    }
+    // Data scalars are bit patterns.  Section 6.2.4 requires zero extension
+    // when the selected scalar datatype is wider than XLEN; signedness is
+    // applied only after the extended bit pattern is formed.
     return raw;
 }
 
@@ -558,6 +557,48 @@ zttScaleInteger(const ZttWideInt &value, const ZttWideInt &exponent,
     return zttRoundWideShiftRight(value, amount, mode);
 }
 
+inline ZttWideInt
+zttScaleIntegerAcc(const ZttWideInt &value, const ZttWideInt &exponent,
+                   const ZttWideInt &addend, ZttIntegerRoundingMode mode)
+{
+    if (!exponent || !value)
+        return addend + value;
+
+    const ZttWideInt limit = 4096;
+    if (exponent > 0) {
+        const uint64_t amount = exponent > limit ? 4096 :
+            exponent.convert_to<uint64_t>();
+        return addend + (value << amount);
+    }
+
+    const ZttWideInt magnitude = -exponent;
+    const uint64_t amount = magnitude > limit ? 4097 :
+        magnitude.convert_to<uint64_t>();
+    if (amount > 4096) {
+        // The fractional term is non-zero but smaller than the supported
+        // arbitrary-precision shift limit.  Its exact position relative to
+        // the adjacent integers is known without materialising a 2^4097
+        // divisor: positive values lie just above D, negative values just
+        // below D.
+        if (value > 0) {
+            if (mode == ZttIntegerRoundingMode::Rod && addend % 2 == 0)
+                return addend + 1;
+            return addend;
+        }
+        if (mode == ZttIntegerRoundingMode::Rdn)
+            return addend - 1;
+        if (mode == ZttIntegerRoundingMode::Rod &&
+            (addend - 1) % 2 != 0)
+            return addend - 1;
+        return addend;
+    }
+
+    // D + A / 2^amount is represented exactly until the one final integer
+    // rounding operation.
+    return zttRoundWideShiftRight(
+        (addend << amount) + value, amount, mode);
+}
+
 inline long double
 zttScaleFloat(long double value, const ZttWideInt &exponent)
 {
@@ -624,14 +665,14 @@ zttExecuteIntegerElement(
     case ZttElemwiseOp::Ldexp: value = zttScaleInteger(
         av, scalarExponent ? *scalarExponent : bv,
         destType.integerRounding); break;
-    case ZttElemwiseOp::LdexpAcc: value = oldv + zttScaleInteger(
-        av, scalarExponent ? *scalarExponent : bv,
+    case ZttElemwiseOp::LdexpAcc: value = zttScaleIntegerAcc(
+        av, scalarExponent ? *scalarExponent : bv, oldv,
         destType.integerRounding); break;
     case ZttElemwiseOp::Rdexp: value = zttScaleInteger(
         av, -(scalarExponent ? *scalarExponent : bv),
         destType.integerRounding); break;
-    case ZttElemwiseOp::RdexpAcc: value = oldv + zttScaleInteger(
-        av, -(scalarExponent ? *scalarExponent : bv),
+    case ZttElemwiseOp::RdexpAcc: value = zttScaleIntegerAcc(
+        av, -(scalarExponent ? *scalarExponent : bv), oldv,
         destType.integerRounding); break;
     case ZttElemwiseOp::CmovGe: result = av < 0 ? old : b; return true;
     case ZttElemwiseOp::CmovLt: result = av < 0 ? b : old; return true;
@@ -753,11 +794,18 @@ zttConvertElement(unsigned __int128 raw, const ZttTypeInfo &sourceType,
         const uint64_t fraction = bits & zttBitMask(fractionBits);
         const uint64_t exponent = (bits >> fractionBits) & exponentMask;
         const bool negative = (bits >> (sourceType.bits - 1)) & 1;
-        if (zttFloatIsNaN(raw, sourceType) ||
-            (sourceType.hasInfinity && exponent == exponentMask &&
-             fraction == 0)) {
+        if (zttFloatIsNaN(raw, sourceType)) {
             zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
             return zttWideToRaw(ZttWideInt(0), destType, fpEnv);
+        }
+
+        if (sourceType.hasInfinity && exponent == exponentMask &&
+            fraction == 0) {
+            zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+            const ZttWideInt overflow = negative ?
+                -(ZttWideInt(1) << destType.bits) :
+                 (ZttWideInt(1) << destType.bits);
+            return zttWideToRaw(overflow, destType, fpEnv);
         }
 
         // Decode the finite source directly into an integer significand and a
@@ -839,7 +887,7 @@ zttSameTypeMaxMin(unsigned __int128 lhs, unsigned __int128 rhs,
         const unsigned __int128 sign =
             static_cast<unsigned __int128>(1) << (type.bits - 1);
         if (((lhs | rhs) & ~sign) == 0)
-            return maximum ? 0 : sign;
+            return maximum ? (lhs & rhs & sign) : ((lhs | rhs) & sign);
         const bool lhsLess = zttSoftFloatLess(lhs, rhs, type);
         return maximum ? (lhsLess ? rhs : lhs) : (lhsLess ? lhs : rhs);
     }
@@ -854,7 +902,7 @@ zttSameTypeMaxMin(unsigned __int128 lhs, unsigned __int128 rhs,
     if (left == 0.0L && right == 0.0L) {
         const unsigned __int128 sign =
             static_cast<unsigned __int128>(1) << (type.bits - 1);
-        return maximum ? 0 : sign;
+        return maximum ? (lhs & rhs & sign) : ((lhs | rhs) & sign);
     }
     return maximum ? (left < right ? rhs : lhs) :
                      (left < right ? lhs : rhs);
@@ -973,6 +1021,23 @@ zttRoundIntegerFraction(long double value, ZttIntegerRoundingMode mode)
     return lower;
 }
 
+inline bool
+zttExactAddNegativeZero(long double lhs, long double rhs,
+                        ZttRoundingMode rounding)
+{
+    const bool lhsNegative = std::signbit(lhs);
+    const bool rhsNegative = std::signbit(rhs);
+    if (lhsNegative == rhsNegative)
+        return lhsNegative;
+    return rounding == ZttRoundingMode::Rdn;
+}
+
+inline long double
+zttSignedZero(bool negative)
+{
+    return std::copysign(0.0L, negative ? -1.0L : 1.0L);
+}
+
 inline unsigned __int128
 zttElemBitwise(unsigned __int128 lhs, unsigned __int128 rhs,
                const ZttTypeInfo &type, ZttElemwiseOp op)
@@ -1004,6 +1069,214 @@ zttSoftFloatCanonicalizeNaN(unsigned __int128 raw,
         zttSoftFloatCanonicalNaN(type) : raw;
 }
 
+struct ZttDyadic
+{
+    ZttWideInt coefficient;
+    int exponent;
+    bool negativeZero;
+};
+
+inline ZttDyadic
+zttDecodeDyadic(unsigned __int128 raw, const ZttTypeInfo &type)
+{
+    const int fractionBits = type.bits - type.expWidth - 1;
+    const int bias = (1 << (type.expWidth - 1)) - 1;
+    const uint64_t fraction = raw & zttBitMask(fractionBits);
+    const int exponent = (raw >> fractionBits) & zttBitMask(type.expWidth);
+    ZttWideInt coefficient = fraction;
+    if (exponent)
+        coefficient += ZttWideInt(1) << fractionBits;
+    const bool negative = (raw >> (type.bits - 1)) & 1;
+    if (negative)
+        coefficient = -coefficient;
+    return {coefficient, (exponent ? exponent - bias : 1 - bias) -
+        fractionBits, negative};
+}
+
+inline ZttDyadic
+zttDyadicNegate(ZttDyadic value)
+{
+    value.coefficient = -value.coefficient;
+    value.negativeZero = !value.negativeZero;
+    return value;
+}
+
+inline ZttDyadic
+zttDyadicAdd(const ZttDyadic &a, const ZttDyadic &b, ZttRoundingMode mode)
+{
+    const int exponent = std::min(a.exponent, b.exponent);
+    ZttWideInt sum = (a.coefficient << (a.exponent - exponent)) +
+        (b.coefficient << (b.exponent - exponent));
+    const bool negative = !a.coefficient && !b.coefficient &&
+        a.negativeZero == b.negativeZero ? a.negativeZero :
+        mode == ZttRoundingMode::Rdn;
+    return {sum, exponent, negative};
+}
+
+inline ZttDyadic
+zttDyadicMul(const ZttDyadic &a, const ZttDyadic &b)
+{
+    return {a.coefficient * b.coefficient, a.exponent + b.exponent,
+        a.negativeZero != b.negativeZero};
+}
+
+inline unsigned __int128
+zttEncodeDyadic(const ZttDyadic &value, const ZttTypeInfo &type,
+                 ZttFpEnv &fpEnv)
+{
+    const bool negative = value.coefficient < 0 ||
+        (!value.coefficient && value.negativeZero);
+    const uint64_t sign = uint64_t(negative) << (type.bits - 1);
+    if (!value.coefficient)
+        return sign;
+    const ZttWideInt magnitude = value.coefficient < 0 ?
+        -value.coefficient : value.coefficient;
+    const int fractionBits = type.bits - type.expWidth - 1;
+    const int bias = (1 << (type.expWidth - 1)) - 1;
+    const int top = boost::multiprecision::msb(magnitude);
+    int quantum = std::max(top + value.exponent - fractionBits,
+                           1 - bias - fractionBits);
+    const int shift = quantum - value.exponent;
+    ZttWideInt rounded;
+    bool inexact = false;
+    if (shift <= 0) {
+        rounded = magnitude << -shift;
+    } else {
+        rounded = magnitude >> shift;
+        const ZttWideInt remainder = magnitude - (rounded << shift);
+        inexact = remainder != 0;
+        const ZttWideInt half = ZttWideInt(1) << (shift - 1);
+        bool increment = false;
+        switch (type.rounding) {
+        case ZttRoundingMode::Rne:
+            increment = remainder > half ||
+                (remainder == half && (rounded & 1) != 0); break;
+        case ZttRoundingMode::Rmm: increment = remainder >= half; break;
+        case ZttRoundingMode::Rdn: increment = negative && inexact; break;
+        case ZttRoundingMode::Rup: increment = !negative && inexact; break;
+        case ZttRoundingMode::Rno:
+            increment = inexact && (rounded & 1) == 0; break;
+        case ZttRoundingMode::Rtz: break;
+        }
+        if (increment)
+            ++rounded;
+    }
+    const uint64_t hidden = uint64_t(1) << fractionBits;
+    if (rounded >= (ZttWideInt(hidden) << 1)) {
+        rounded >>= 1;
+        ++quantum;
+    }
+    const int exponent = quantum + fractionBits;
+    const bool e4m3 = type.kind == ZttElemType::Fp8E4M3;
+    const int maxExponent = e4m3 ? bias + 1 : bias;
+    const uint64_t maxSignificand = e4m3 ? (hidden << 1) - 2 :
+        (hidden << 1) - 1;
+    if (exponent > maxExponent ||
+        (exponent == maxExponent && rounded > maxSignificand)) {
+        zttAccrueFpFlags(fpEnv, ZttFpFlagOF | ZttFpFlagNX);
+        return zttFloatOverflowBits(type, negative);
+    }
+    const uint64_t significand = rounded.convert_to<uint64_t>();
+    if (inexact)
+        zttAccrueFpFlags(fpEnv, ZttFpFlagNX |
+            (significand < hidden ? ZttFpFlagUF : 0));
+    const uint64_t field = significand < hidden ? 0 : exponent + bias;
+    return sign | (field << fractionBits) | (significand & (hidden - 1));
+}
+
+inline bool
+zttTryExactFloatElement(ZttFpEnv &fpEnv, unsigned __int128 a,
+    unsigned __int128 b, unsigned __int128 old,
+    const ZttTypeInfo &destType, const ZttTypeInfo &lhsType,
+    const ZttTypeInfo &rhsType, ZttElemwiseOp op,
+    unsigned __int128 &result)
+{
+    // All accepted standard finite encodings are exact dyadics, including
+    // E4M3 (whose highest exponent contains finite values) and mixed tuples.
+    if (!destType.isFloating || !lhsType.isFloating ||
+        !rhsType.isFloating || !destType.hasDenormals ||
+        !lhsType.hasDenormals || !rhsType.hasDenormals)
+        return false;
+    if (!std::isfinite(zttFloatValue(a, lhsType)) ||
+        !std::isfinite(zttFloatValue(b, rhsType)) ||
+        !std::isfinite(zttFloatValue(old, destType)))
+        return false;
+    auto av = zttDecodeDyadic(a, lhsType);
+    auto bv = zttDecodeDyadic(b, rhsType);
+    auto dv = zttDecodeDyadic(old, destType);
+    ZttDyadic value = av;
+    const auto add = [&](const ZttDyadic &x, const ZttDyadic &y) {
+        return zttDyadicAdd(x, y, destType.rounding);
+    };
+    switch (op) {
+    case ZttElemwiseOp::Abs:
+        if (value.coefficient < 0) value = zttDyadicNegate(value);
+        value.negativeZero = false; break;
+    case ZttElemwiseOp::Broadcast: break;
+    case ZttElemwiseOp::AbsDiff:
+        value = add(av, zttDyadicNegate(bv));
+        if (value.coefficient < 0) value = zttDyadicNegate(value);
+        value.negativeZero = false; break;
+    case ZttElemwiseOp::Add: value = add(av, bv); break;
+    case ZttElemwiseOp::Sub: value = add(bv, zttDyadicNegate(av)); break;
+    case ZttElemwiseOp::HalfDiff:
+        value = add(bv, zttDyadicNegate(av)); --value.exponent; break;
+    case ZttElemwiseOp::Mean:
+        value = add(av, bv); --value.exponent; break;
+    case ZttElemwiseOp::Mul: value = zttDyadicMul(av, bv); break;
+    case ZttElemwiseOp::MulNeg:
+        value = zttDyadicNegate(zttDyadicMul(av, bv)); break;
+    case ZttElemwiseOp::MulAcc: value = add(dv, zttDyadicMul(av, bv)); break;
+    case ZttElemwiseOp::MulAccNeg:
+        value = add(dv, zttDyadicNegate(zttDyadicMul(av, bv))); break;
+    case ZttElemwiseOp::MulAdd: value = add(av, zttDyadicMul(bv, dv)); break;
+    case ZttElemwiseOp::MulSub:
+        value = add(av, zttDyadicNegate(zttDyadicMul(bv, dv))); break;
+    case ZttElemwiseOp::Rec:
+    case ZttElemwiseOp::Sqrt:
+    case ZttElemwiseOp::Rsqrt: {
+        if (!av.coefficient ||
+            (av.coefficient < 0 && op != ZttElemwiseOp::Rec))
+            return false;
+        const bool negative = av.coefficient < 0;
+        const ZttWideInt magnitude = negative ? -av.coefficient :
+            av.coefficient;
+        const int exponent = boost::multiprecision::msb(magnitude) +
+            av.exponent;
+        const int rootExponent = exponent >= 0 ? exponent / 2 :
+            -((-exponent + 1) / 2);
+        const int resultExponent = op == ZttElemwiseOp::Rec ?
+            -exponent - 1 : op == ZttElemwiseOp::Sqrt ? rootExponent :
+            -rootExponent - 1;
+        const int quantum = resultExponent - 256;
+        ZttWideInt numerator = op == ZttElemwiseOp::Sqrt ? magnitude :
+            ZttWideInt(1);
+        ZttWideInt denominator = op == ZttElemwiseOp::Sqrt ?
+            ZttWideInt(1) : magnitude;
+        const int shift = op == ZttElemwiseOp::Rec ?
+            -av.exponent - quantum : op == ZttElemwiseOp::Sqrt ?
+            av.exponent - 2 * quantum : -av.exponent - 2 * quantum;
+        if (shift >= 0) numerator <<= shift;
+        else denominator <<= -shift;
+        ZttWideInt coefficient = numerator / denominator;
+        if (op != ZttElemwiseOp::Rec)
+            coefficient = boost::multiprecision::sqrt(coefficient);
+        const ZttWideInt represented = op == ZttElemwiseOp::Rec ?
+            ZttWideInt(coefficient * denominator) :
+            ZttWideInt(coefficient * coefficient * denominator);
+        // Retain a sticky bit far below every supported destination LSB.
+        // The integer quotient/root comparisons also detect exact results.
+        if (represented != numerator)
+            coefficient |= 1;
+        value = {negative ? -coefficient : coefficient, quantum, negative};
+        break;
+    }
+    default: return false;
+    }
+    result = zttEncodeDyadic(value, destType, fpEnv);
+    return true;
+}
+
 inline bool
 zttTrySoftFloatElement(
     ZttFpEnv &fpEnv, unsigned __int128 a, unsigned __int128 b,
@@ -1031,6 +1304,17 @@ zttTrySoftFloatElement(
                 zttSoftFloatLessEqual(bv, av, *compareType) :
                 zttSoftFloatLess(av, bv, *compareType));
         result = comparison ? zttBitMask128(destType.bits) : 0;
+        return true;
+    }
+
+    if (op == ZttElemwiseOp::AbsDiff &&
+        zttIsNarrowFloatType(destType) &&
+        zttSameFloatEncoding(lhsType, destType) &&
+        zttSameFloatEncoding(rhsType, destType)) {
+        result = RiscvISA::ZttFloatBackend::absDiff(
+            static_cast<uint16_t>(a), static_cast<uint16_t>(b),
+            zttNarrowFloatFormat(destType),
+            zttBackendRounding(destType.rounding));
         return true;
     }
 
@@ -1074,6 +1358,50 @@ zttTrySoftFloatElement(
         return true;
     }
 
+    // These are the only operations implemented by this destination-domain
+    // SoftFloat path.  Check before converting operands so a rejected probe
+    // cannot leave conversion exception flags in fpEnv.
+    switch (op) {
+    case ZttElemwiseOp::Abs:
+    case ZttElemwiseOp::Broadcast:
+    case ZttElemwiseOp::Add:
+    case ZttElemwiseOp::Sub:
+    case ZttElemwiseOp::HalfDiff:
+    case ZttElemwiseOp::Mean:
+    case ZttElemwiseOp::Max:
+    case ZttElemwiseOp::Min:
+    case ZttElemwiseOp::Mul:
+    case ZttElemwiseOp::MulAcc:
+    case ZttElemwiseOp::MulAccNeg:
+    case ZttElemwiseOp::MulAdd:
+    case ZttElemwiseOp::MulNeg:
+    case ZttElemwiseOp::MulSub:
+    case ZttElemwiseOp::Rec:
+    case ZttElemwiseOp::Rsqrt:
+    case ZttElemwiseOp::Sqrt:
+        break;
+    case ZttElemwiseOp::AbsDiff:
+        // Directed rounding makes round(A-B) followed by abs() observably
+        // different from one final rounding of |A-B|.  Use the exact-value
+        // fallback for non-narrow formats below.
+        return false;
+    default:
+        return false;
+    }
+
+    if ((op == ZttElemwiseOp::HalfDiff || op == ZttElemwiseOp::Mean) &&
+        (!zttIsNarrowFloatType(destType) ||
+         !zttSameFloatEncoding(lhsType, destType) ||
+         !zttSameFloatEncoding(rhsType, destType)))
+        return false;
+
+    // A conversion into the destination before the operation is a rounding
+    // point.  Mixed standard tuples must retain source precision and use the
+    // exact finite-value path above; special values use the fallback below.
+    if (!zttSameFloatEncoding(lhsType, destType) ||
+        !zttSameFloatEncoding(rhsType, destType))
+        return false;
+
     if (!zttSoftFloatCompatible(lhsType, destType) ||
         !zttSoftFloatCompatible(rhsType, destType))
         return false;
@@ -1087,11 +1415,7 @@ zttTrySoftFloatElement(
                         (destType.bits - 1));
         break;
     case ZttElemwiseOp::AbsDiff:
-        result = zttSoftFloatBinary(
-            av, bv, destType, ZttSoftBinaryOp::Sub, fpEnv);
-        result &= ~(static_cast<unsigned __int128>(1) <<
-                    (destType.bits - 1));
-        break;
+        return false;
     case ZttElemwiseOp::Broadcast:
         result = av;
         break;
@@ -1105,11 +1429,6 @@ zttTrySoftFloatElement(
         break;
     case ZttElemwiseOp::HalfDiff:
     case ZttElemwiseOp::Mean:
-        if (!zttIsNarrowFloatType(destType) ||
-            !zttSameFloatEncoding(lhsType, destType) ||
-            !zttSameFloatEncoding(rhsType, destType)) {
-            return false;
-        }
         fpEnv.setRounding(destType.rounding);
         result = RiscvISA::ZttFloatBackend::halfSum(
             static_cast<uint16_t>(av), static_cast<uint16_t>(bv),
@@ -1138,10 +1457,9 @@ zttTrySoftFloatElement(
         result = zttSoftFloatMulAdd(bv, oldv, av, destType, fpEnv);
         break;
     case ZttElemwiseOp::MulNeg:
-        result = zttSoftFloatNegate(
-            zttSoftFloatBinary(
-                av, bv, destType, ZttSoftBinaryOp::Mul, fpEnv),
-            destType);
+        result = zttSoftFloatBinary(
+            zttSoftFloatNegate(av, destType), bv, destType,
+            ZttSoftBinaryOp::Mul, fpEnv);
         break;
     case ZttElemwiseOp::MulSub:
         result = zttSoftFloatMulAdd(
@@ -1251,6 +1569,29 @@ zttExecuteElementwise(ExecContext *xc, ZttFpEnv &fpEnv,
                 op == ZttElemwiseOp::LdexpAcc ||
                 op == ZttElemwiseOp::Rdexp ||
                 op == ZttElemwiseOp::RdexpAcc;
+            if (scaleOp && destType.isFloating &&
+                destType.hasDenormals) {
+                const auto scaleRaw = fixedExponent ? b : a;
+                const auto &scaleType = fixedExponent ? rhsType :
+                    effectiveLhsType;
+                if (scaleType.isFloating && scaleType.hasDenormals &&
+                    std::isfinite(zttFloatValue(scaleRaw, scaleType)) &&
+                    std::isfinite(zttFloatValue(old, destType))) {
+                    ZttWideInt exponent = fixedExponent ? scalarExponent :
+                        zttWideInteger(b, rhsType);
+                    if (op == ZttElemwiseOp::Rdexp ||
+                        op == ZttElemwiseOp::RdexpAcc)
+                        exponent = -exponent;
+                    auto value = zttDecodeDyadic(scaleRaw, scaleType);
+                    value.exponent += zttNarrowScaleExponent(exponent);
+                    if (readsDest)
+                        value = zttDyadicAdd(zttDecodeDyadic(old, destType),
+                                             value, destType.rounding);
+                    zttWriteTileElement(dest, destType, len, row, col,
+                        zttEncodeDyadic(value, destType, fpEnv));
+                    continue;
+                }
+            }
             if (scaleOp && zttIsNarrowFloatType(destType)) {
                 const bool leftScale = op == ZttElemwiseOp::Ldexp ||
                     op == ZttElemwiseOp::LdexpAcc;
@@ -1283,6 +1624,13 @@ zttExecuteElementwise(ExecContext *xc, ZttFpEnv &fpEnv,
                     continue;
                 }
             }
+            if (zttTryExactFloatElement(
+                    fpEnv, a, b, old, destType, effectiveLhsType, rhsType,
+                    op, softResult)) {
+                zttWriteTileElement(
+                    dest, destType, len, row, col, softResult);
+                continue;
+            }
             if (zttTrySoftFloatElement(
                     fpEnv, a, b, old, destType, effectiveLhsType, rhsType,
                     op, softResult)) {
@@ -1310,6 +1658,9 @@ zttExecuteElementwise(ExecContext *xc, ZttFpEnv &fpEnv,
             case ZttElemwiseOp::Sub: value = bv - av; break;
             case ZttElemwiseOp::HalfDiff:
                 value = (bv - av) / 2.0L;
+                if (value == 0.0L)
+                    value = zttSignedZero(zttExactAddNegativeZero(
+                        bv, -av, destType.rounding));
                 if (!destType.isFloating)
                     value = zttRoundIntegerFraction(
                         value, destType.integerRounding);
@@ -1343,8 +1694,12 @@ zttExecuteElementwise(ExecContext *xc, ZttFpEnv &fpEnv,
             case ZttElemwiseOp::LdexpAcc: {
                 const ZttWideInt exponent = fixedExponent ? scalarExponent :
                     zttWideInteger(b, rhsType);
-                value = oldv + zttScaleFloat(
+                const long double scaled = zttScaleFloat(
                     fixedExponent ? bv : av, exponent);
+                value = oldv + scaled;
+                if (value == 0.0L)
+                    value = zttSignedZero(zttExactAddNegativeZero(
+                        oldv, scaled, destType.rounding));
                 break;
             }
             case ZttElemwiseOp::Rdexp: {
@@ -1356,7 +1711,11 @@ zttExecuteElementwise(ExecContext *xc, ZttFpEnv &fpEnv,
             case ZttElemwiseOp::RdexpAcc: {
                 const ZttWideInt exponent = fixedExponent ? scalarExponent :
                     zttWideInteger(b, rhsType);
-                value = oldv + zttScaleFloat(av, -exponent);
+                const long double scaled = zttScaleFloat(av, -exponent);
+                value = oldv + scaled;
+                if (value == 0.0L)
+                    value = zttSignedZero(zttExactAddNegativeZero(
+                        oldv, scaled, destType.rounding));
                 break;
             }
             case ZttElemwiseOp::Exp2: value = std::exp2(av); break;
@@ -1694,13 +2053,26 @@ zttExecuteScatter(ExecContext *xc, ZttFpEnv &fpEnv,
                     valueType.bits == destType.bits) {
                     result = zttSameTypeAdd(current, source, destType, fpEnv);
                 } else {
+                    const long double currentValue =
+                        zttElemNumeric(current, destType);
+                    const long double sourceValue =
+                        zttElemNumeric(source, valueType);
                     if (zttFloatIsSignalingNaN(current, destType) ||
                         (valueType.isFloating &&
                          zttFloatIsSignalingNaN(source, valueType)))
                         zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
-                    result = zttRoundFloat(
-                        zttElemNumeric(current, destType) +
-                        zttElemNumeric(source, valueType), destType, &fpEnv);
+                    if (std::isinf(currentValue) && std::isinf(sourceValue) &&
+                        std::signbit(currentValue) != std::signbit(sourceValue))
+                        zttAccrueFpFlags(fpEnv, ZttFpFlagNV);
+                    long double sum = currentValue + sourceValue;
+                    const bool exactCancellation =
+                        sum == 0.0L && currentValue == -sourceValue &&
+                        std::signbit(currentValue) != std::signbit(sourceValue);
+                    if (destType.rounding == ZttRoundingMode::Rdn &&
+                        exactCancellation) {
+                        sum = -0.0L;
+                    }
+                    result = zttRoundFloat(sum, destType, &fpEnv);
                 }
             } else if (!valueType.isFloating) {
                 result = zttWideToRaw(
@@ -1795,9 +2167,10 @@ zttExecuteRowUnzip(RiscvISA::MatRegContainer &dest,
 let {{
     def zttElemwiseBehaviour(op, scalar=False, unary=False):
         setup = '''
+            constexpr ZttElemwiseOp zttOp = ZttElemwiseOp::%s;
             ZttTypeInfo destType, lhsType, rhsType;
             uint32_t len;
-        '''
+        ''' % op
         if scalar:
             setup += '''
             if (!zttGetDatatype(xc, zttDest, false, zttDestType,
@@ -1812,7 +2185,7 @@ let {{
             const RegVal zttScalarType =
                 xc->readMiscReg(MISCREG_AMESTYPE);
             if (!zttValidateElementwiseTuple(
-                    xc, ZttElemwiseOp::%s, destType, lhsType, rhsType,
+                    xc, zttOp, destType, lhsType, rhsType,
                     zttDestType, zttScalarType, zttMatrixType, true))
                 return NoFault;
             uint32_t destPack, matrixPack, destGroup, matrixGroup;
@@ -1849,7 +2222,7 @@ let {{
                     matrixSource, physicalBits, rhsType, len, square);
                 zttExecuteElementwise(
                     xc, zttFpEnv, destSquare, matrixSquare, matrixSquare,
-                    destType, lhsType, rhsType, len, ZttElemwiseOp::%s,
+                    destType, lhsType, rhsType, len, zttOp,
                     true, zttScalar, scalarLeft);
                 zttInsertMOperandSquare(
                     result, physicalBits, destType, len, square,
@@ -1857,7 +2230,7 @@ let {{
             }
             zttCommitMOperand(
                 xc, destBase, destSpan, result, zttDestReg);
-            ''' % (op, op)
+            '''
         elif unary:
             setup += '''
             if (!zttGetDatatype(xc, zttDest, false, zttDestType,
@@ -1869,7 +2242,7 @@ let {{
                 return NoFault;
             rhsType = lhsType;
             if (!zttValidateElementwiseTuple(
-                    xc, ZttElemwiseOp::%s, destType, lhsType, rhsType,
+                    xc, zttOp, destType, lhsType, rhsType,
                     zttDestType, zttSrcType, zttSrcType, false))
                 return NoFault;
             uint32_t destPack, srcPack, destGroup, srcGroup;
@@ -1900,30 +2273,29 @@ let {{
                     srcSource, physicalBits, lhsType, len, square);
                 RiscvISA::MatRegContainer destSquare;
                 destSquare.zero();
-                if (zttElemwiseIsReduce(ZttElemwiseOp::%s)) {
-                    const bool column = ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::ReduceAddCol || ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::ReduceMaxCol || ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::ReduceMinCol;
+                if (zttElemwiseIsReduce(zttOp)) {
+                    const bool column =
+                        zttOp == ZttElemwiseOp::ReduceAddCol ||
+                        zttOp == ZttElemwiseOp::ReduceMaxCol ||
+                        zttOp == ZttElemwiseOp::ReduceMinCol;
                     zttExecuteReduce(
                         xc, zttFpEnv, destSquare, srcSquare, destType,
-                        lhsType, len, ZttElemwiseOp::%s, column);
-                } else if (zttElemwiseIsPrefix(ZttElemwiseOp::%s)) {
-                    const bool column = ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::PrefixAddCol || ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::PrefixMaxCol;
+                        lhsType, len, zttOp, column);
+                } else if (zttElemwiseIsPrefix(zttOp)) {
+                    const bool column =
+                        zttOp == ZttElemwiseOp::PrefixAddCol ||
+                        zttOp == ZttElemwiseOp::PrefixMaxCol;
                     zttExecutePrefix(
                         xc, zttFpEnv, destSquare, srcSquare, destType,
-                        lhsType, len, ZttElemwiseOp::%s, column);
-                } else if (zttElemwiseIsPermutation(
-                               ZttElemwiseOp::%s)) {
+                        lhsType, len, zttOp, column);
+                } else if (zttElemwiseIsPermutation(zttOp)) {
                     zttExecutePermutation(
                         xc, destSquare, srcSquare, srcSquare, destType,
-                        lhsType, lhsType, len, ZttElemwiseOp::%s);
+                        lhsType, lhsType, len, zttOp);
                 } else {
                     zttExecuteUnary(
                         xc, zttFpEnv, destSquare, srcSquare, destType,
-                        lhsType, len, ZttElemwiseOp::%s);
+                        lhsType, len, zttOp);
                 }
                 zttInsertMOperandSquare(
                     result, physicalBits, destType, len, square,
@@ -1931,7 +2303,7 @@ let {{
             }
             zttCommitMOperand(
                 xc, destBase, destSpan, result, zttDestReg);
-            ''' % tuple([op] * 13)
+            '''
         else:
             setup += '''
             if (!zttGetDatatype(xc, zttDest, false, zttDestType,
@@ -1945,7 +2317,7 @@ let {{
                 !zttTileLen(xc, rhsType, len))
                 return NoFault;
             if (!zttValidateElementwiseTuple(
-                    xc, ZttElemwiseOp::%s, destType, lhsType, rhsType,
+                    xc, zttOp, destType, lhsType, rhsType,
                     zttDestType, zttLhsType, zttRhsType, false))
                 return NoFault;
             uint32_t destPack, lhsPack, rhsPack;
@@ -1958,12 +2330,12 @@ let {{
                 !zttGroupSize(xc, rhsType, rhsGroup))
                 return NoFault;
             const bool fixedSquareOp =
-                ZttElemwiseOp::%s == ZttElemwiseOp::Gather ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::GatherRow ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddCol ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddRow ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxCol ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxRow;
+                zttOp == ZttElemwiseOp::Gather ||
+                zttOp == ZttElemwiseOp::GatherRow ||
+                zttOp == ZttElemwiseOp::ScatterAddCol ||
+                zttOp == ZttElemwiseOp::ScatterAddRow ||
+                zttOp == ZttElemwiseOp::ScatterMaxCol ||
+                zttOp == ZttElemwiseOp::ScatterMaxRow;
             if (fixedSquareOp &&
                 (destPack != 1 || lhsPack != 1 || rhsPack != 1 ||
                  rhsType.isFloating)) {
@@ -1971,10 +2343,10 @@ let {{
                 return NoFault;
             }
             const bool exponentOp =
-                ZttElemwiseOp::%s == ZttElemwiseOp::Ldexp ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::LdexpAcc ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::Rdexp ||
-                ZttElemwiseOp::%s == ZttElemwiseOp::RdexpAcc;
+                zttOp == ZttElemwiseOp::Ldexp ||
+                zttOp == ZttElemwiseOp::LdexpAcc ||
+                zttOp == ZttElemwiseOp::Rdexp ||
+                zttOp == ZttElemwiseOp::RdexpAcc;
             if (exponentOp && rhsType.isFloating) {
                 zttSetUnsupported(xc);
                 return NoFault;
@@ -2011,27 +2383,26 @@ let {{
                     lhsSource, physicalBits, lhsType, len, square);
                 const auto rhsSquare = zttExtractMOperandSquare(
                     rhsSource, physicalBits, rhsType, len, square);
-                if (ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddCol ||
-                    ZttElemwiseOp::%s == ZttElemwiseOp::ScatterAddRow ||
-                    ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxCol ||
-                    ZttElemwiseOp::%s == ZttElemwiseOp::ScatterMaxRow) {
-                    const bool column = ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::ScatterAddCol || ZttElemwiseOp::%s ==
-                        ZttElemwiseOp::ScatterMaxCol;
+                if (zttOp == ZttElemwiseOp::ScatterAddCol ||
+                    zttOp == ZttElemwiseOp::ScatterAddRow ||
+                    zttOp == ZttElemwiseOp::ScatterMaxCol ||
+                    zttOp == ZttElemwiseOp::ScatterMaxRow) {
+                    const bool column =
+                        zttOp == ZttElemwiseOp::ScatterAddCol ||
+                        zttOp == ZttElemwiseOp::ScatterMaxCol;
                     zttExecuteScatter(
                         xc, zttFpEnv, destSquare, lhsSquare, rhsSquare,
                         destType,
-                        lhsType, rhsType, len, ZttElemwiseOp::%s, column);
-                } else if (zttElemwiseIsPermutation(
-                               ZttElemwiseOp::%s)) {
+                        lhsType, rhsType, len, zttOp, column);
+                } else if (zttElemwiseIsPermutation(zttOp)) {
                     zttExecutePermutation(
                         xc, destSquare, lhsSquare, rhsSquare, destType,
-                        lhsType, rhsType, len, ZttElemwiseOp::%s);
+                        lhsType, rhsType, len, zttOp);
                 } else {
                     zttExecuteElementwise(
                         xc, zttFpEnv, destSquare, lhsSquare, rhsSquare,
                         destType,
-                        lhsType, rhsType, len, ZttElemwiseOp::%s, false, 0);
+                        lhsType, rhsType, len, zttOp, false, 0);
                 }
                 zttInsertMOperandSquare(
                     result, physicalBits, destType, len, square,
@@ -2039,7 +2410,7 @@ let {{
             }
             zttCommitMOperand(
                 xc, destBase, destSpan, result, zttDestReg);
-            ''' % tuple([op] * 21)
+            '''
         return setup
 }};
 
