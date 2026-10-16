@@ -35,7 +35,8 @@ CASES := \
 	gemm_mixed \
 	gelu \
 	softmax \
-	mha
+	mha \
+	ffn
 
 BUILD_DIR := $(CURDIR)/build
 SUITE_REPORT := $(BUILD_DIR)/reports/EXAMPLE_REPORT.md
