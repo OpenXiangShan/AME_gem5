@@ -202,7 +202,7 @@ $(TARGET_BINARY):
 else
 $(HOST_BINARY): $(SOURCES) $(COMMON_HEADERS) $(GENERATED_HEADERS) $(BUILD_CONFIG) | check-host-tools
 	@mkdir -p $(HOST_DIR) $(LOG_DIR)
-	$(HOST_CC) $(HOST_CFLAGS) $(SOURCES) -o $@ 2>&1 | tee $(LOG_DIR)/host-build.log
+	$(HOST_CC) $(HOST_CFLAGS) $(SOURCES) $(HOST_LDLIBS) -o $@ 2>&1 | tee $(LOG_DIR)/host-build.log
 
 $(TARGET_BINARY): $(SOURCES) $(COMMON_HEADERS) $(GENERATED_HEADERS) $(BUILD_CONFIG) $(RUNTIME_SOURCES) $(RUNTIME_HEADERS) $(RUNTIME_DIR)/link.ld | check-target-tools
 	@mkdir -p $(TARGET_DIR) $(LOG_DIR)

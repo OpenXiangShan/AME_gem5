@@ -45,6 +45,7 @@
 #define ZTT_LLM_SILU_SWISH 8
 #define ZTT_LLM_SOFTMAX 9
 #define ZTT_LLM_SOFTMAX_SCALE_MASK 10
+#define ZTT_LLM_ROPE 11
 #define ZTT_LLM_MHA 12
 #define ZTT_LLM_FFN 13
 
