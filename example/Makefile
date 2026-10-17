@@ -35,14 +35,16 @@ CASES := \
 	gemm_mixed \
 	gelu \
 	softmax \
-	mha
+	mha \
+  rope
 
 BUILD_DIR := $(CURDIR)/build
 SUITE_REPORT := $(BUILD_DIR)/reports/EXAMPLE_REPORT.md
 
 .DEFAULT_GOAL := help
 .NOTPARALLEL: test $(CASES)
-.PHONY: help build test report stats clean $(CASES) \
+.PHONY: help build test report stats clean learning learning-check \
+	$(CASES) $(LEARNING_CASES) \
 	$(addprefix build-,$(CASES)) $(addprefix test-,$(CASES))
 
 help:
@@ -52,6 +54,8 @@ help:
 	@echo "  make -C gemm_fp32 test-host-golden  Use configured matrices + Host C golden"
 	@echo "  make -C gemm_fp32 test-reference    Use configured matrices + reference"
 	@echo "  make test        Build and test all cases"
+	@echo "  make learning    Build and test the ADD and msettyp learning cases"
+	@echo "  make learning-check  Check the staged Ztt learning index"
 	@echo "  make build       Build all Host/RISC-V binaries and disassemblies"
 	@echo "  make clean       Remove all example build output"
 	@echo
@@ -68,6 +72,11 @@ build: $(addprefix build-,$(CASES))
 
 test: $(addprefix test-,$(CASES)) report
 
+learning: $(addprefix learning-,$(LEARNING_CASES))
+
+learning-check:
+	+$(MAKE) --no-print-directory -C learning_ztt check
+
 $(CASES):
 	+$(MAKE) --no-print-directory -C $@ test
 
@@ -75,6 +84,9 @@ $(addprefix build-,$(CASES)): build-%:
 	+$(MAKE) --no-print-directory -C $* all
 
 $(addprefix test-,$(CASES)): test-%:
+	+$(MAKE) --no-print-directory -C $* test
+
+$(addprefix learning-,$(LEARNING_CASES)): learning-%:
 	+$(MAKE) --no-print-directory -C $* test
 
 report:
