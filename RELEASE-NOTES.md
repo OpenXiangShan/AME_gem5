@@ -1,7 +1,23 @@
+# Version 25.1.1.1-dev
+
+## Large Language Model (LLM) Inference Operators
+
+- Added example and test support for INT8 GEMM, mixed-precision GEMM,
+  GELU, Softmax, MHA, RMSNorm, RoPE, and FFN operators used in
+  large language model inference.
+
 # Version 25.1.1.0-dev
+
+## AME Ztt v0.6
+
+- Added simulation support for the AME Ztt v0.6 instruction set,
+  including all instructions defined by the specification.
+- Added the required RISC-V instruction decoding, execution, and toolchain
+  support.
 
 The notes below are inherited from upstream gem5 25.1.0.1.
 
+## Version 25.0.0.1
 **[HOTFIX]** This is a hotfix release incorporating the following critical fixes highlighted below. This release addresses urgent issues that required immediate attention outside the regular release schedule.
 
 - [#2492](https://github.com/gem5/gem5/pull/2492): Fixes the writeback type for AArch FP16 instructions.

@@ -36,8 +36,9 @@ CASES := \
 	gelu \
 	softmax \
 	mha \
-  ffn \
-  rope
+	ffn \
+	rope \
+	rmsnorm
 
 BUILD_DIR := $(CURDIR)/build
 SUITE_REPORT := $(BUILD_DIR)/reports/EXAMPLE_REPORT.md
