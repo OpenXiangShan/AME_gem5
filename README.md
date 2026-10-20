@@ -20,6 +20,11 @@ AME_gem5 is an open-source simulation and validation environment built upon the 
   - Matrix Multiply
   - Reduction
 
+- **Large Language Model (LLM) Inference Operators**
+  - Matrix multiplication: FP32 GEMM, INT8 GEMM, mixed-precision GEMM
+  - Normalization and activation: RMSNorm, GELU, Softmax
+  - Transformer components: RoPE, MHA, FFN
+
 See the community release of spec Ztt v0.6 for details.
 
 ## Quick Start
@@ -43,6 +48,13 @@ Then, install the toolchain:
 ```sh
 ./scripts/build_toolchain.sh
 ```
+
+Or, to build the AME LLVM toolchain from source, use:
+
+```sh
+./scripts/build_toolchain.sh --src
+```
+
 ### Run examples and tests
 
 Build and test an operator example:

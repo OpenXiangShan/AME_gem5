@@ -109,11 +109,29 @@ endif
 HOST_CC ?= $(CC)
 CLANG_ROOT ?= $(if $(AMEGEM5_CLANG_ROOT),$(AMEGEM5_CLANG_ROOT),$(if $(AMEGEM5_TOOLCHAIN),$(AMEGEM5_TOOLCHAIN),$(AMEGEM5_ROOT)/toolchain/install))
 RISCV_TOOLCHAIN_ROOT ?= $(if $(AMEGEM5_RISCV_TOOLCHAIN_ROOT),$(AMEGEM5_RISCV_TOOLCHAIN_ROOT),$(CLANG_ROOT)/riscv64-unknown-elf)
+RISCV_GCC ?= $(shell command -v riscv64-unknown-elf-gcc 2>/dev/null)
+TOOLCHAIN_MODE ?= $(if $(AMEGEM5_TOOLCHAIN_MODE),$(AMEGEM5_TOOLCHAIN_MODE),$(strip $(shell test -f "$(CLANG_ROOT)/.ame_toolchain_mode" && cat "$(CLANG_ROOT)/.ame_toolchain_mode")))
 
 CLANG ?= $(if $(AMEGEM5_CLANG),$(AMEGEM5_CLANG),$(firstword $(wildcard $(CLANG_ROOT)/bin/clang $(CLANG_ROOT)/clang)))
 LLVM_OBJDUMP ?= $(if $(AMEGEM5_OBJDUMP),$(AMEGEM5_OBJDUMP),$(firstword $(wildcard $(CLANG_ROOT)/bin/llvm-objdump $(CLANG_ROOT)/llvm-objdump)))
 CLANG_RESOURCE_DIR ?= $(if $(AMEGEM5_CLANG_RESOURCE_DIR),$(AMEGEM5_CLANG_RESOURCE_DIR),$(or $(lastword $(sort $(wildcard $(CLANG_ROOT)/lib/clang/*))),$(shell test -x "$(CLANG)" && "$(CLANG)" -print-resource-dir 2>/dev/null || true)))
-TARGET_LIBGCC ?= $(firstword $(wildcard $(RISCV_TOOLCHAIN_ROOT)/gcc/libgcc.a $(RISCV_TOOLCHAIN_ROOT)/riscv64-unknown-elf/gcc/libgcc.a))
+TARGET_LIBGCC ?= $(firstword \
+	$(wildcard $(RISCV_TOOLCHAIN_ROOT)/gcc/libgcc.a \
+		$(RISCV_TOOLCHAIN_ROOT)/riscv64-unknown-elf/gcc/libgcc.a) \
+	$(if $(RISCV_GCC),$(shell "$(RISCV_GCC)" -print-libgcc-file-name 2>/dev/null)))
+
+ifeq ($(TOOLCHAIN_MODE),source)
+TARGET_MARCH ?= rv64gcv_boscztt
+TARGET_ZTT_PROFILE ?= -mboscztt-profile=ame-gem5
+TARGET_OBJDUMP_FEATURE ?= +boscztt,+boscztt-ame-gem5
+TARGET_LD_MODE ?= -fuse-ld=lld
+else
+TARGET_MARCH ?= rv64gcv_xxiangshanztt
+TARGET_ZTT_PROFILE ?=
+TARGET_OBJDUMP_FEATURE ?= +xxiangshanztt
+TARGET_LD_MODE ?=
+endif
+
 GEM5 ?= $(if $(AMEGEM5_GEM5),$(AMEGEM5_GEM5),$(AMEGEM5_ROOT)/build/RISCV/gem5.opt)
 MEM_SIZE ?= 128MiB
 MATRIX_OP_LAT ?= 16
@@ -127,7 +145,8 @@ HOST_CFLAGS := -O2 -g -Wall -Wextra -Werror -I$(COMMON_DIR) $(MATRIX_BUILD_FLAGS
 TARGET_CFLAGS := \
 	-target riscv64-unknown-elf \
 	-resource-dir $(CLANG_RESOURCE_DIR) \
-	-march=rv64gcv_xxiangshanztt \
+	-march=$(TARGET_MARCH) \
+	$(TARGET_ZTT_PROFILE) \
 	-mabi=lp64d \
 	-O2 -g -Wall -Wextra -Werror \
 	-ffreestanding -fno-builtin -mcmodel=medany \
@@ -135,6 +154,7 @@ TARGET_CFLAGS := \
 	-fno-vectorize -fno-slp-vectorize -ffp-contract=off \
 	-I$(COMMON_DIR) -I$(RUNTIME_DIR)/include $(MATRIX_BUILD_FLAGS)
 TARGET_LDFLAGS := \
+	$(TARGET_LD_MODE) \
 	-nostdlib -nostartfiles -static \
 	-Wl,-T,$(RUNTIME_DIR)/link.ld \
 	-Wl,--gc-sections
@@ -237,7 +257,7 @@ endif
 
 $(DISASSEMBLY): $(TARGET_BINARY) | check-target-tools
 	@mkdir -p $(DISASM_DIR) $(LOG_DIR)
-	$(LLVM_OBJDUMP) -d --mattr=+xxiangshanztt $< > $@
+	$(LLVM_OBJDUMP) -d --mattr=$(TARGET_OBJDUMP_FEATURE) $< > $@
 
 $(HOST_REPORT): force $(HOST_BINARY)
 	@mkdir -p $(REPORT_DIR) $(LOG_DIR)

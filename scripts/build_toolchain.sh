@@ -29,11 +29,28 @@
 
 set -euo pipefail
 
+BUILD_FROM_SOURCE=0
+case "${1:-}" in
+    "")
+        ;;
+    --src)
+        BUILD_FROM_SOURCE=1
+        ;;
+    *)
+        echo "Usage: $0 [--src]" >&2
+        exit 2
+        ;;
+esac
+
 SCRIPT_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd -- "$SCRIPT_DIR/.." && pwd)
 
 LLVM_SUBMODULE="$REPO_ROOT/toolchain/AME_llvm"
 INSTALL_DIR="$REPO_ROOT/toolchain/install"
+CLANG_BIN="$INSTALL_DIR/bin/clang"
+LLD_BIN="$INSTALL_DIR/bin/ld.lld"
+RISCV_TOOLCHAIN_DIR="$INSTALL_DIR/riscv64-unknown-elf"
+TOOLCHAIN_MODE_FILE="$INSTALL_DIR/.ame_toolchain_mode"
 SUBMODULE_SSH_URL="git@github.com:OpenXiangShan/AME_llvm.git"
 SUBMODULE_HTTPS_URL="https://github.com/OpenXiangShan/AME_llvm.git"
 
@@ -42,6 +59,64 @@ LLVM_ARCHIVE_PART_PREFIX="$LLVM_ARCHIVE.part"
 LLVM_ARCHIVE_CHECKSUM="$LLVM_SUBMODULE/ame_toolchain.sha256"
 ARCHIVE_TO_EXTRACT="$LLVM_ARCHIVE"
 MERGED_ARCHIVE=""
+
+if (( BUILD_FROM_SOURCE )); then
+    if [[ ! -d "$LLVM_SUBMODULE/.git" && ! -f "$LLVM_SUBMODULE/.git" ]]; then
+        git -C "$REPO_ROOT" submodule sync --recursive
+        if ! git -C "$REPO_ROOT" submodule update --init --recursive; then
+            echo "[WARN] SSH submodule access failed; retrying with HTTPS" >&2
+            git -C "$REPO_ROOT" \
+                -c "url.$SUBMODULE_HTTPS_URL.insteadOf=$SUBMODULE_SSH_URL" \
+                submodule update --init --recursive
+        fi
+    fi
+
+    git -C "$LLVM_SUBMODULE" checkout ztt-v0.6
+
+    (
+        cd "$LLVM_SUBMODULE"
+        mkdir -p build-boscztt
+        cmake -S llvm -B build-boscztt -G Ninja \
+            -DCMAKE_INSTALL_PREFIX="../install" \
+            -DCMAKE_BUILD_TYPE="Release" \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_TARGETS_TO_BUILD="RISCV" \
+            -DLLVM_ENABLE_ASSERTIONS=ON
+        cmake --build build-boscztt --target clang lld llvm-objdump
+
+        # Install only the tools required by example/. A full CMake install can
+        # include optional libraries which were not built by the selected
+        # targets.
+        mkdir -p ../install/bin ../install/lib/clang
+        cp -a build-boscztt/bin/clang* ../install/bin/
+        cp -a build-boscztt/bin/lld build-boscztt/bin/ld.lld ../install/bin/
+        cp -a build-boscztt/bin/llvm-objdump ../install/bin/
+        find build-boscztt/lib/clang -mindepth 1 -maxdepth 1 -type d \
+            -exec cp -a {} ../install/lib/clang/ \;
+    )
+
+    [[ -x "$CLANG_BIN" ]] || {
+        echo "[FAIL] source-built clang was not installed: $CLANG_BIN" >&2
+        exit 1
+    }
+    [[ -x "$LLD_BIN" ]] || {
+        echo "[FAIL] source-built ld.lld was not installed: $LLD_BIN" >&2
+        exit 1
+    }
+    [[ -x "$INSTALL_DIR/bin/llvm-objdump" ]] || {
+        echo "[FAIL] source-built llvm-objdump was not installed" >&2
+        exit 1
+    }
+
+    printf '%s\n' source > "$TOOLCHAIN_MODE_FILE"
+    echo "[PASS] Toolchain built from source and installed to $INSTALL_DIR"
+    exit 0
+fi
+
+if [[ -x "$CLANG_BIN" && -x "$LLD_BIN" && -d "$RISCV_TOOLCHAIN_DIR" ]]; then
+    echo "[PASS] Toolchain already installed at $INSTALL_DIR"
+    exit 0
+fi
 
 verify_checksum() {
     local archive=$1
@@ -102,5 +177,6 @@ rm -rf -- "$INSTALL_DIR"
 mkdir -p -- "$INSTALL_DIR"
 tar -xzf "$ARCHIVE_TO_EXTRACT" -C "$INSTALL_DIR"
 rm -f -- "$INSTALL_DIR/ame_toolchain.tar.gz"
+printf '%s\n' packaged > "$TOOLCHAIN_MODE_FILE"
 
 echo "[PASS] Toolchain extracted to $INSTALL_DIR"

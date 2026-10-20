@@ -1,5 +1,5 @@
 [submodule "toolchain/AME_llvm"]
 	path = toolchain/AME_llvm
-	url = git@github.com:OpenXiangShan/AME_llvm.git
+	url = https://github.com/OpenXiangShan/AME_llvm.git
 	branch = ztt-v0.6-dev
 	shallow = true
