@@ -133,7 +133,7 @@ jobs:
               working-directory: ${{ github.workspace }}
               run: scons build/ALL/gem5.fast -j "$CI_BUILD_JOBS"
 
-# Custom Ztt floating-point unit tests.
+# Custom Ztt floating-point unit tests and mixed-input ISA regression.
     ztt-tests:
         name: ztt-float-unit-test
         runs-on: [self-hosted, linux, x64, bosc, open]
@@ -166,11 +166,12 @@ jobs:
                   python3-config --includes
                   pkg-config --exists python3-embed protobuf zlib
 
-            - name: Build Ztt floating-point unit tests
+            - name: Build RISC-V simulator and Ztt floating-point unit tests
               run: |
                   mkdir -p ci-results
-                  scons build/RISCV/arch/riscv/insts/ztt_float.test.opt \
-                    -j "$CI_BUILD_JOBS" 2>&1 | tee ci-results/ztt-float-build.log
+                  scons build/RISCV/gem5.opt \
+                    build/RISCV/arch/riscv/insts/ztt_float.test.opt \
+                    -j "$CI_BUILD_JOBS" 2>&1 | tee ci-results/ztt-build.log
 
             - name: Run Ztt floating-point unit tests
               timeout-minutes: 5
@@ -178,6 +179,74 @@ jobs:
                   build/RISCV/arch/riscv/insts/ztt_float.test.opt \
                     --gtest_output=xml:ci-results/ztt-float.xml \
                     2>&1 | tee ci-results/ztt-float.log
+
+            - name: Install AME example toolchain
+              timeout-minutes: 10
+              run: |
+                  bash scripts/build_toolchain.sh \
+                    2>&1 | tee ci-results/ztt-toolchain.log
+
+            - name: Run mixed-input GEMM ISA regression
+              timeout-minutes: 10
+              run: |
+                  make -C example/gemm_mixed_source_types test \
+                    2>&1 | tee ci-results/ztt-mixed-types.log
+
+    example-operator-tests:
+        name: example-operator-tests
+        runs-on: ubuntu-24.04
+        if: github.event.pull_request.draft == false
+        timeout-minutes: 180
+        env:
+            CI_BUILD_JOBS: '4'
+        steps:
+            - uses: actions/checkout@v7
+
+            - name: Install gem5 build dependencies
+              run: |
+                  sudo apt-get update
+                  sudo apt-get install -y \
+                    build-essential \
+                    m4 \
+                    scons \
+                    python3-dev \
+                    pkg-config \
+                    zlib1g-dev \
+                    libprotobuf-dev \
+                    protobuf-compiler \
+                    libprotoc-dev
+
+            - name: Build RISC-V gem5
+              run: |
+                  mkdir -p ci-results
+                  scons build/RISCV/gem5.opt -j "$CI_BUILD_JOBS" \
+                    2>&1 | tee ci-results/example-gem5-build.log
+
+            - name: Install AME example toolchain
+              timeout-minutes: 10
+              run: |
+                  bash scripts/build_toolchain.sh \
+                    2>&1 | tee ci-results/example-toolchain.log
+
+            - name: Run existing operator examples
+              timeout-minutes: 30
+              run: |
+                  make -C example \
+                    gemm_fp32 gemm_int8 gemm_mixed \
+                    gelu softmax mha ffn rope rmsnorm \
+                    2>&1 | tee ci-results/example-operators.log
+
+            - name: Upload example test results
+              if: always()
+              uses: actions/upload-artifact@v7
+              with:
+                  name: example-operator-results-${{ github.run_id }}-${{ github.run_attempt }}
+                  path: |
+                      ci-results/example-*.log
+                      example/build/reports/
+                      example/*/build/reports/
+                      example/*/build/logs/
+                  if-no-files-found: warn
 
     ci-tests:
     # Wait for all independent checks, including both unit-test variants.
@@ -190,6 +259,7 @@ jobs:
             - pre-commit
             - clang-format-check
             - ztt-tests
+            - example-operator-tests
         steps:
             - name: Check all required jobs
               env:
