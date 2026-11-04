@@ -33,6 +33,7 @@ CASES := \
 	gemm_fp32 \
 	gemm_int8 \
 	gemm_mixed \
+	gemm_mixed_source_types \
 	gelu \
 	softmax \
 	mha \
@@ -53,6 +54,7 @@ help:
 	@echo "AME_gem5 Ztt v0.6 examples"
 	@echo
 	@echo "  make gemm_fp32   Build and test one case on Host and MinorCPU"
+	@echo "  make gemm_mixed_source_types  Test mixed input datatypes on Host and MinorCPU"
 	@echo "  make -C gemm_fp32 test-host-golden  Use configured matrices + Host C golden"
 	@echo "  make -C gemm_fp32 test-reference    Use configured matrices + reference"
 	@echo "  make test        Build and test all cases"

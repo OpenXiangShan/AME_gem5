@@ -92,17 +92,8 @@ let {{
                 !zttGroupSize(xc, rhsType, rhsGroupSize)) {
                 return NoFault;
             }
-            const bool zttTypesCompatible =
-                lhsRaw == rhsRaw &&
-                lhsType.isFloating == rhsType.isFloating &&
-                lhsType.isFloating == accType.isFloating &&
-                lhsType.bits <= 128 && rhsType.bits <= 128 &&
-                accType.bits <= 128 &&
-                (lhsType.isFloating ||
-                 (lhsType.isSigned == rhsType.isSigned &&
-                  lhsType.isSigned == accType.isSigned &&
-                  accType.bits >= lhsType.bits &&
-                  !(accType.bits == 128 && accType.saturating)));
+            const bool zttTypesCompatible = zttMatrixMulTypesCompatible(
+                lhsType, rhsType, accType, lhsRaw, rhsRaw);
             if (!zttTypesCompatible ||
                 (lhsType.isFloating && !zttIsSupportedFloatType(lhsType)) ||
                 (rhsType.isFloating && !zttIsSupportedFloatType(rhsType)) ||
@@ -192,9 +183,15 @@ let {{
                             sum = zttNegateProduct ? current - product :
                                                     current + product;
                         } else if (accType.isSigned) {
-                            const __int128 product =
-                                zttSignedValue(lhs, lhsType.bits) *
-                                zttSignedValue(rhs, rhsType.bits);
+                            const __int128 lhsValue = lhsType.isSigned ?
+                                zttSignedValue(lhs, lhsType.bits) :
+                                static_cast<__int128>(
+                                    lhs & zttBitMask128(lhsType.bits));
+                            const __int128 rhsValue = rhsType.isSigned ?
+                                zttSignedValue(rhs, rhsType.bits) :
+                                static_cast<__int128>(
+                                    rhs & zttBitMask128(rhsType.bits));
+                            const __int128 product = lhsValue * rhsValue;
                             const __int128 result =
                                 zttSignedValue(sum, accType.bits) +
                                 (zttNegateProduct ? -product : product);
@@ -272,6 +269,46 @@ class ZttArithStaticInst : public ZttStaticInst
 output header {{
 namespace
 {
+
+inline bool
+zttMatrixMulTypesCompatible(
+    const ZttTypeInfo &lhsType, const ZttTypeInfo &rhsType,
+    const ZttTypeInfo &accType, RegVal lhsRaw, RegVal rhsRaw)
+{
+    const bool sameTuple =
+        lhsRaw == rhsRaw &&
+        lhsType.isFloating == rhsType.isFloating &&
+        lhsType.isFloating == accType.isFloating &&
+        lhsType.bits <= 128 && rhsType.bits <= 128 &&
+        accType.bits <= 128 &&
+        (lhsType.isFloating ||
+         (lhsType.isSigned == rhsType.isSigned &&
+          lhsType.isSigned == accType.isSigned &&
+          accType.bits >= lhsType.bits &&
+          !(accType.bits == 128 && accType.saturating)));
+    if (sameTuple)
+        return true;
+
+    if (accType.kind == ZttElemType::I32) {
+        switch (lhsType.kind) {
+          case ZttElemType::I8:
+            return rhsType.kind == ZttElemType::I4 ||
+                   rhsType.kind == ZttElemType::U8 ||
+                   rhsType.kind == ZttElemType::U4;
+          case ZttElemType::I4:
+          case ZttElemType::U8:
+          case ZttElemType::U4:
+            return rhsType.kind == ZttElemType::I8;
+          default:
+            return false;
+        }
+    }
+    return accType.kind == ZttElemType::Fp32 &&
+           ((lhsType.kind == ZttElemType::Fp8E4M3 &&
+             rhsType.kind == ZttElemType::Fp8E5M2) ||
+            (lhsType.kind == ZttElemType::Fp8E5M2 &&
+             rhsType.kind == ZttElemType::Fp8E4M3));
+}
 
 enum class ZttElemwiseOp : uint8_t {
     Abs, AbsDiff, Add, And, AndNot, Broadcast, CmovGe, CmovLt,
